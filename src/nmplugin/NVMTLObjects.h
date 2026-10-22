@@ -47,6 +47,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
   nvk_buffer _hostBuf; BOOL _hostOn;   // the image lies on the IOSurface's own pages (nvmtl_surface_image_create)
+  BOOL _hostCopy; size_t _hostRow;     // or a private image the GPU copies to and from those pages (_hostBuf, rows _hostRow apart)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;

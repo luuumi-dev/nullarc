@@ -912,6 +912,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     // panel then copied the write-combined result again (2026-10-20). NVMTL_NO_SURFACE_HOST=1 keeps the copies.
     static int hostOn = -1;
     if (hostOn < 0) hostOn = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST");
+    nvk_buffer copyBuf = { 0 }; size_t copyRow = 0;   // the imported pages, kept for a private image's GPU copies
     if (hostOn && surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1) {
         void *base = IOSurfaceGetBaseAddress(surf);
         const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
@@ -928,7 +929,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                         nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
                     return 0;
                 }
-                nvmtl_vk_buffer_destroy(&hb);
+                copyBuf = hb; copyRow = row;   // no linear image at this pitch (RADV wants 256-byte rows)
             }
         }
     }
@@ -938,6 +939,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             nvk_buffer vb;
             if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+                    if (copyBuf.buf) nvmtl_vk_buffer_destroy(&copyBuf);
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
@@ -958,12 +960,17 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     if (!stex && nvmtl_vk_format_is_storage(vkf)) stex = 1;
     if (surf) {
         const size_t prow = IOSurfaceGetBytesPerRow(surf), pplanes = IOSurfaceGetPlaneCount(surf);
-        nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out (%s; row %zu bytes, %zu plane(s))",
-              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane,
+        nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out %s (%s; row %zu bytes, %zu plane(s))",
+              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane, copyBuf.buf ? "by the GPU over the surface's imported pages" : "through the CPU",
               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
-              : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
+              : (prow % 32) ? "the row is not a multiple of 32 bytes" : copyBuf.buf ? "no linear image at this row pitch" : "the family VRAM could not be used", prow, pplanes);
     }
-    return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    const int rc = nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    if (copyBuf.buf) {
+        if (rc) nvmtl_vk_buffer_destroy(&copyBuf);
+        else { t->_hostBuf = copyBuf; t->_hostCopy = YES; t->_hostRow = copyRow; }
+    }
+    return rc;
 }
 
 static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
