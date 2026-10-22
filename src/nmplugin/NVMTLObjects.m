@@ -825,12 +825,12 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     if (!brec && nvmtl_vk_image_create_buffer_alias((uint32_t)w, (uint32_t)h, vkf, bpp, a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
                                            (d.usage & MTLTextureUsageRenderTarget) != 0, &_b, offset, bpr, &t->_i)) {
         // RADV aliases only rows that are a multiple of 256 bytes. CoreAnimation hands WindowServer small layer contents
-        // (a line of typed text 234x18, rows of 960 bytes; a 28x40 caret or glyph, rows of 128) as buffers, and each nil
+        // (a line of typed text 234x18, rows of 960 bytes; A8 glyph masks 29x29 to 66x27, rows of 64 or 128) as buffers, and each nil
         // here left that layer undrawn: typed characters vanished in Spotlight and Messages until a longer line happened
         // to get a usable pitch (10-23). A texture that is only read gets a private image refilled from the buffer by the
         // GPU at each use instead (nvmtlSurfaceIn); one the GPU writes still has no stand-in.
         const BOOL readOnly = !(d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget));
-        if (readOnly && bpp && !a8 && bpr % bpp == 0 && bpr >= w * bpp && offset % 4 == 0 && offset % bpp == 0
+        if (readOnly && bpp && bpr % bpp == 0 && bpr >= w * bpp && offset % 4 == 0 && offset % bpp == 0
             && offset + bpr * (h - 1) + w * bpp <= _b.size
             && !nvmtl_vk_image_create_typed((uint32_t)w, (uint32_t)h, vkf, bpp, a8, 1, 0, 2u, 1u, &t->_i)) {
             copied = YES; t->_bufCopy = YES;
