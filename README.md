@@ -39,6 +39,8 @@ in October 2026:
 
 Other Radeon 780M / 760M machines (Phoenix, Hawk Point) are untested.
 
+Known bugs and gaps, ranked by severity, are tracked in [BUGS.md](BUGS.md) (in Russian).
+
 ## How it works
 
 ```mermaid
