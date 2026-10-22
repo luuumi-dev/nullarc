@@ -821,11 +821,27 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     const uint32_t bkey[12] = { 2, (uint32_t)w, (uint32_t)h, vkf, bpp, (uint32_t)a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
         (d.usage & MTLTextureUsageRenderTarget) != 0, (uint32_t)offset, (uint32_t)((uint64_t)offset >> 32), (uint32_t)bpr, (uint32_t)((uint64_t)bpr >> 32) };
     const BOOL brec = !noRecycle && _nbpk && nvmtl_bpark_take(self, bkey, &t->_i) == 0;
+    BOOL copied = NO;
     if (!brec && nvmtl_vk_image_create_buffer_alias((uint32_t)w, (uint32_t)h, vkf, bpp, a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
                                            (d.usage & MTLTextureUsageRenderTarget) != 0, &_b, offset, bpr, &t->_i)) {
-        nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu, buffer %lu B, storage %lu) -> nil (reason above)",
-              (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)_b.size, (unsigned long)_storage);
+        // RADV aliases only rows that are a multiple of 256 bytes. CoreAnimation hands WindowServer small layer contents
+        // (a line of typed text 234x18, rows of 960 bytes; a 28x40 caret or glyph, rows of 128) as buffers, and each nil
+        // here left that layer undrawn: typed characters vanished in Spotlight and Messages until a longer line happened
+        // to get a usable pitch (10-23). A texture that is only read gets a private image refilled from the buffer by the
+        // GPU at each use instead (nvmtlSurfaceIn); one the GPU writes still has no stand-in.
+        const BOOL readOnly = !(d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget));
+        if (readOnly && bpp && !a8 && bpr % bpp == 0 && bpr >= w * bpp && offset % 4 == 0 && offset % bpp == 0
+            && offset + bpr * (h - 1) + w * bpp <= _b.size
+            && !nvmtl_vk_image_create_typed((uint32_t)w, (uint32_t)h, vkf, bpp, a8, 1, 0, 2u, 1u, &t->_i)) {
+            copied = YES; t->_bufCopy = YES;
+            static unsigned nc; if (nc++ < 8 || nc % 1000 == 0)
+                nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu) -> a private image refilled from the buffer at each use (#%u)",
+                      (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, nc);
+        } else {
+        nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu usage 0x%lx, buffer %lu B, storage %lu) -> nil (reason above)",
+              (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)d.usage, (unsigned long)_b.size, (unsigned long)_storage);
         return nil; }
+    }
     t->_q = nvmtl_device_queue();
     t->_fmt = d.pixelFormat; t->_mips = 1;
     t->_stex = t->_i.storage != 0;
@@ -833,7 +849,7 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     t->_usage = d.usage;
     _texSeen = YES;
     t->_backBuf = self; t->_backOff = offset; t->_backBPR = bpr;
-    t->_bparkable = !noRecycle; memcpy(t->_pkey, bkey, sizeof bkey);
+    t->_bparkable = !noRecycle && !copied; memcpy(t->_pkey, bkey, sizeof bkey);
     atomic_fetch_add(brec ? &gBTRecycled : &gBTNew, 1); nvmtl_buftex_census(brec ? "recycled" : "new");
     nvmtl_texture_desc_swizzle(t, d);
     nvlog("buffer %p newTextureWithDescriptor:offset:%lu bytesPerRow:%lu -> %p (%zux%zu fmt %lu usage 0x%lx, storage %lu)", (__bridge void *)self,
@@ -1227,8 +1243,15 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
+static void nvmtl_buffer_sync_in(NVMTLBuffer *b);
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
+    if (r->_bufCopy) {   // refilled from its buffer at every use: the buffer's writer gives no seed to compare
+        nvmtl_buffer_sync_in(r->_backBuf);   // a no-copy buffer whose pages were not imported is a copy: bring it up first
+        if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 1))
+            { static int said; if (said++ < 4) nvlog("buffer texture copy: refill FAILED (%ux%u at offset %lu, bytesPerRow %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff, (unsigned long)r->_backBPR); }
+        return;
+    }
     if (!r->_surf || r->_hostOn) return;   // host-backed: the GPU reads the surface's own pages
     @synchronized (nvmtl_surface_sync(r)) {
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
@@ -1244,7 +1267,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
     int rc = -1;
-    if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, row, 1);
+    if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, row, 1);
     if (rc && base && row) rc = nvmtl_vk_image_write(r->_q, &r->_i, base, row);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
@@ -1307,7 +1330,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
     int rc = -1;
-    if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, row, 0);
+    if (r->_hostCopy && row == r->_hostRow) rc = nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_hostBuf, 0, row, 0);
     if (rc && base && row) rc = nvmtl_vk_image_read(r->_q, &r->_i, base, row);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);

@@ -6322,15 +6322,17 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
 // OpenGL surface (rows of width x 4 bytes) got a private image that surface-in and surface-out copied through a staging
 // buffer with memcpy: 2 x 14 MB a frame at 2400x1500, ~13 ms, and 3D OpenGL apps such as Chess stuck near 60 fps or
 // below (10-23). Uncompressed formats with whole texels per row only; the caller keeps the copying path otherwise.
-int nvmtl_vk_image_host_xfer(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t row_bytes, int to_image)
+// Also a buffer texture whose rows RADV will not alias (newTextureWithDescriptor:offset:bytesPerRow:) is filled from
+// its buffer this way, from offset.
+int nvmtl_vk_image_host_xfer(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t offset, size_t row_bytes, int to_image)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
-    if (img->bw > 1 || img->bh > 1 || row_bytes % bpp || row_bytes / bpp < img->w
-        || row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size) return -1;
+    if (img->bw > 1 || img->bh > 1 || row_bytes % bpp || row_bytes / bpp < img->w || offset % 4 || offset % bpp
+        || offset > hb->size || row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size - offset) return -1;
     if (!to_image) nvmtl_vk_image_upload_barrier(img);   // a readback must observe a pending async upload: finish it first
     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
     VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    VkBufferImageCopy bic = { offset, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     if (to_image) {
         VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
