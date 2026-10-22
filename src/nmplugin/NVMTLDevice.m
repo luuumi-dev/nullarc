@@ -1349,8 +1349,21 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
     if (!u) return nvmtl_fail(err, [NSString stringWithFormat:@"newDefaultLibraryWithBundle: %@ has no default.metallib", b.bundlePath]);
     return [self newLibraryWithURL:u error:err];
 }
+// Apple's neural-network kernels (Espresso's convolutions, MPSNeuralNetwork) hang this GPU within seconds of starting:
+// XProtect's remediators and Photos' analysis ran them in the background and took WindowServer down with them
+// (2026-10-21, 2026-10-22). Their libraries are refused here, so those frameworks run the networks on the CPU.
+// NVMTL_ALLOW_NN=1 lets them through, for debugging the hang.
+static BOOL nvmtl_nn_library(NSString *path) {
+    static int allow = -1;
+    if (allow < 0) { const char *e = getenv("NVMTL_ALLOW_NN"); allow = e && e[0] == '1'; }
+    if (allow || !path) return NO;
+    if (![path containsString:@"/Espresso.framework/"] && ![path containsString:@"/MPSNeuralNetwork.framework/"]) return NO;
+    static int said; if (!said++) nvlog("library: %s refused - neural-network kernels hang this GPU, the framework runs them on the CPU", path.UTF8String);
+    return YES;
+}
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)err {
     if (err) *err = nil;
+    if (nvmtl_nn_library(url.path)) return nvmtl_fail(err, @"newLibraryWithURL: neural-network kernels are not run on this GPU");
     NSString *fp = url.isFileURL ? url.absoluteURL.path : nil; struct stat s0; int st0 = fp ? stat(fp.fileSystemRepresentation, &s0) : -1;
     NSData *d = [NSData dataWithContentsOfURL:url];
     if (!d && url.path.length) {
@@ -1373,6 +1386,7 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
 - (id<MTLLibrary>)nvmtlLibraryFromPath:(NSString *)path error:(NSError **)err {
     if (err) *err = nil;
     if (!path) return nvmtl_fail(err, @"newLibraryWithFile: nil path");
+    if (nvmtl_nn_library(path)) return nvmtl_fail(err, @"newLibraryWithFile: neural-network kernels are not run on this GPU");
     struct stat s0; const int st0 = stat(path.fileSystemRepresentation, &s0);
     NSData *d = [NSData dataWithContentsOfFile:path];
     if (!d) return nvmtl_fail(err, [NSString stringWithFormat:@"newLibraryWithFile: cannot read %@", path]);

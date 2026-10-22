@@ -417,6 +417,20 @@ static int nvmtl_skip_empty_on(void) {
         _gpuTiming.host_after_ns = commands->timing.host_after_ns;
     }
 }
+// NVMTL_WS_GPUTIME=1 (WindowServer only): where a command buffer's time goes, averaged over 2000 at a time: from its
+// submission to the GPU starting it, the GPU running it, and from the GPU finishing to the plugin seeing that.
+static void nvmtl_ws_gputime(double submitted, double start, double end, double seen)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_WS_GPUTIME"); on = e && e[0] == '1' && getprogname() && !strcmp(getprogname(), "WindowServer"); }
+    if (!on || !submitted || !start || end < start) return;
+    static double q, run, done, runMax; static unsigned n;
+    q += start - submitted; run += end - start; done += seen - end; if (end - start > runMax) runMax = end - start;
+    if (++n < 2000) return;
+    nvlog("WS GPU time over %u command buffers: queued %.0f us, running %.0f us (max %.0f), finished-to-seen %.0f us",
+          n, q / n * 1e6, run / n * 1e6, runMax * 1e6, done / n * 1e6);
+    q = run = done = runMax = 0; n = 0;
+}
 - (void)nvmtlFinishExecution:(NSError *)error {
     if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
@@ -441,6 +455,7 @@ static int nvmtl_skip_empty_on(void) {
     [_completionCondition lock];
     _gpuStart = deviceStart; _gpuEnd = deviceEnd;
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+    nvmtl_ws_gputime(_legacyKernelStart, deviceStart, deviceEnd, _legacyKernelEnd);
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
     [_completionCondition unlock];

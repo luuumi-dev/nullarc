@@ -5082,16 +5082,31 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)popDebugGroup {}
 - (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
 - (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
+// Whether cb wrote an IOSurface (its parts' dirtied surfaces), which something outside this queue may read: the display
+// pipe, a capture's CPU lock, another process.
+static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb) {
+    for (NVMTLSubmissionPart *part in cb->_parts) {
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in part->surfaces) if (t->_surf) return YES;
+    }
+    return NO;
+}
 // The display-pipe swap follows this call immediately in WindowServer. NVAccel
 // cannot order that swap after an NVK fence, so wait for the pixels to finish
 // before allowing the surface to become scanout. Other applications keep the
 // normal submission-only contract.
 - (BOOL)commitAndWaitUntilSubmitted {
-    static int ws = -1;
+    static int ws = -1, internalWait = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    if (internalWait < 0) { const char *e = getenv("NVMTL_WS_WAIT_INTERNAL"); internalWait = e && e[0] == '1'; }
     [self commit];
-    // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit)
-    if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit).
+    // Without it WindowServer still waits here only for a command buffer that wrote an IOSurface. CoreAnimation's
+    // offscreen passes (its set_surface flushes) draw into the plugin's own textures, which only later work on this
+    // in-order queue reads; waiting for each of them serialised CPU and GPU, 1.8 ms a frame while a Phone window was
+    // dragged (2026-10-21). NVMTL_WS_WAIT_INTERNAL=1 waits for those again.
+    if (ws && !nvmtl_ws_kernel_waits() && (internalWait || nvmtl_cb_writes_surfaces(self))) [self waitUntilCompleted];
+    else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
 - (void)commit {
