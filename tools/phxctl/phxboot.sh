@@ -12,6 +12,9 @@ ALLOW=/Library/GPUBundles/nvmtl-allow.txt; DR=/Library/Logs/DiagnosticReports
 exec >>"$LOG" 2>&1
 echo "== $(date '+%F %T') phxboot"
 release() { sysctl -w debug.phxfb_hold=0 >/dev/null 2>&1; }
+# NVRAM changes reach flash on a clean shutdown only, unless forced: the arming written after a good boot was lost when
+# the battery ran out overnight, and the next boot left WindowServer on the firmware framebuffer (2026-10-22)
+nv_commit() { nvram IONVRAM-FORCESYNCNOW-PROPERTY=phxfb >/dev/null 2>&1; }
 apps_only() { printf '# phxboot: Metal for the built-in test tools only\n' > $ALLOW; }
 # every process gets the Metal device; WindowServer too once the accelerator is armed (NullMoth's own default list).
 # Denied ("-name", before "*"): the background neural-network users. mediaanalysisd (Photos analysis, which starts by
@@ -27,7 +30,7 @@ all_apps() { { printf '# phxboot: Metal for every app%s\n' "$1"; for d in $DENY;
 m2_fail() {
     echo "M2 failed ($1): PhxAMDFB off, rebooting"
     apps_only; sysctl -w debug.phxagdc=0 >/dev/null 2>&1
-    nvram -d phxfb-boot; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
+    nvram -d phxfb-boot; nv_commit; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
 }
 # PhxAMDFB comes from the Aux KC, which loads well after PhxBringup: wait for the panel's framebuffer (PhxAMDFB, or
 # IONDRV when PhxAMDFB was not armed) before telling which one took it
@@ -35,7 +38,7 @@ wait_fb() { for i in $(seq 1 90); do ioreg -rc IOFramebuffer -d0 | grep -q 'clas
 if [ -e "$OFF" ]; then echo "kill switch present: nothing to do"; release; exit 0; fi
 if [ -e "$MARK" ]; then
     echo "previous attempt did not finish: phxboot and PhxAMDFB off"
-    touch "$OFF"; rm -f "$MARK"; nvram -d phxfb-boot; sync
+    touch "$OFF"; rm -f "$MARK"; nvram -d phxfb-boot; nv_commit; sync
     wait_fb; ioreg -rc PhxAMDFB -d0 | grep -q PhxAMDFB && { echo "PhxAMDFB took the panel: rebooting"; shutdown -r now; }
     release; exit 0
 fi
@@ -85,7 +88,7 @@ else
     release
     all_apps " (WindowServer stays on the firmware framebuffer)" ""
 fi
-[ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && echo "PhxAMDFB armed for the next boot"
+[ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && { nv_commit; echo "PhxAMDFB armed for the next boot"; }
 rm -f "$MARK"; sync
 echo "done $(date '+%T')"
 
@@ -103,7 +106,7 @@ watch_hangs() {
             echo $now >> $G/hang-reboots
             if [ $(awk -v t=$((now - 3600)) '$1 > t' $G/hang-reboots | wc -l) -ge 3 ]; then
                 echo "3 GPU hangs within an hour: WindowServer goes back to the firmware framebuffer"
-                rm -f $G/phxboot-m2; nvram -d phxfb-boot
+                rm -f $G/phxboot-m2; nvram -d phxfb-boot; nv_commit
             fi
             sync; ${PHX_REBOOT:-shutdown -r now}; return
         fi
