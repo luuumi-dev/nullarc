@@ -262,6 +262,12 @@ static long nvmtl_sysconf(int name)
     long page = getpagesize();
     return page > 0 ? (long)(hi.max_mem / (uint64_t)page) : v;
 }
+// WindowServer runs with real uid root and effective uid _windowserver. Mesa takes that for a setuid program and turns
+// its shader disk cache off (__normal_user()), so every boot compiled every WindowServer pipeline again; on battery in
+// Low Power Mode one compile held the main thread past the 40 s watchdog (10-22). The driver's getuid/getgid answer
+// the effective ids, which own the cache directory.
+static uid_t nvmtl_icd_getuid(void) { return geteuid(); }
+static gid_t nvmtl_icd_getgid(void) { return getegid(); }
 // Point one imported symbol of the image that holds `inside` at `repl` (its lazy and non-lazy pointers). Returns how
 // many pointers were changed. The driver's own dylib only: nothing else in the process is touched.
 static int nvmtl_rebind_import(const void *inside, const char *symbol, void *repl)
@@ -712,6 +718,12 @@ static int nvmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", NVMTL_ICD_LIB, nvmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_sysconf", (void *)nvmtl_sysconf);
               if (rb <= 0) nvlog("vk: memory-size fallback missing: _sysconf not rebound in %s (%d) -- sandboxed apps may have no device", NVMTL_ICD_LIB, rb); }
+            if ((getuid() != geteuid() || getgid() != getegid()) && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
+                const int ru = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_getuid", (void *)nvmtl_icd_getuid);
+                const int rg = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_getgid", (void *)nvmtl_icd_getgid);
+                nvlog("vk: %s runs as uid %d over %d: the driver sees the effective ids, so its shader disk cache stays on (%d+%d pointers)",
+                      getprogname(), (int)geteuid(), (int)getuid(), ru, rg);
+            }
             if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
               if (rb <= 0) nvlog("vk: owned handle fallback missing: _open not rebound in %s (%d)", NVMTL_ICD_LIB, rb); }
             pnvk_stage_import = (void (*)(const nvmtl_vram_rec *))dlsym(g_lib, "nvmtl_nvk_stage_import");
