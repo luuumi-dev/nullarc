@@ -827,12 +827,12 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
         // RADV aliases only rows that are a multiple of 256 bytes. CoreAnimation hands WindowServer small layer contents
         // (a line of typed text 234x18, rows of 960 bytes; A8 glyph masks 29x29 to 66x27, rows of 64 or 128) as buffers, and each nil
         // here left that layer undrawn: typed characters vanished in Spotlight and Messages until a longer line happened
-        // to get a usable pitch (10-23). A texture that is only read gets a private image refilled from the buffer by the
-        // GPU at each use instead (nvmtlSurfaceIn); one the GPU writes still has no stand-in.
-        const BOOL readOnly = !(d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget));
-        if (readOnly && bpp && bpr % bpp == 0 && bpr >= w * bpp && offset % 4 == 0 && offset % bpp == 0
+        // to get a usable pitch (10-23). Such a texture gets a private image instead, which the GPU refills from the buffer
+        // when the buffer's bytes have changed (nvmtlSurfaceIn) and copies back after drawing into it (nvmtlSurfaceOut).
+        const BOOL writes = (d.usage & MTLTextureUsageShaderWrite) != 0;
+        if ((!writes || nvmtl_vk_format_is_storage(vkf)) && bpp && bpr % bpp == 0 && bpr >= w * bpp && offset % 4 == 0 && offset % bpp == 0
             && offset + bpr * (h - 1) + w * bpp <= _b.size
-            && !nvmtl_vk_image_create_typed((uint32_t)w, (uint32_t)h, vkf, bpp, a8, 1, 0, 2u, 1u, &t->_i)) {
+            && !nvmtl_vk_image_create_typed((uint32_t)w, (uint32_t)h, vkf, bpp, a8, 1, writes, 2u, 1u, &t->_i)) {
             copied = YES; t->_bufCopy = YES;
             static unsigned nc; if (nc++ < 8 || nc % 1000 == 0)
                 nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu) -> a private image refilled from the buffer at each use (#%u)",
@@ -926,7 +926,7 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
 static void nvmtl_surf_dirty(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
-    if (!r->_surf) return;
+    if (!r->_surf && !r->_bufCopy) return;
     if (!cb->_surfDirty) cb->_surfDirty = [NSMutableSet new];
     [cb->_surfDirty addObject:r];
 }
@@ -1244,12 +1244,34 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     }
 }
 static void nvmtl_buffer_sync_in(NVMTLBuffer *b);
+static void nvmtl_buffer_sync_out(NVMTLBuffer *b);
+// The CPU's view of a buffer texture's bytes (NULL for a buffer the CPU cannot see) and a hash of its rows.
+static const uint8_t *nvmtl_buftex_bytes(NVMTLTexture *r) {
+    const uint8_t *p = (const uint8_t *)[r->_backBuf contents];
+    return p ? p + r->_backOff : NULL;
+}
+static uint64_t nvmtl_buftex_hash(NVMTLTexture *r, const uint8_t *p) {
+    uint64_t h = 1469598103934665603ull;
+    const size_t row = (size_t)r->_i.w * (r->_i.bpp ? r->_i.bpp : 4);
+    for (uint32_t y = 0; y < r->_i.h; y++) {
+        const uint8_t *q = p + (size_t)y * r->_backBPR; size_t i = 0;
+        for (; i + 8 <= row; i += 8) { uint64_t v; memcpy(&v, q + i, 8); h = (h ^ v) * 1099511628211ull; }
+        for (; i < row; i++) h = (h ^ q[i]) * 1099511628211ull;
+    }
+    return h;
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
-    if (r->_bufCopy) {   // refilled from its buffer at every use: the buffer's writer gives no seed to compare
+    if (r->_bufCopy) {   // refilled when the buffer's bytes differ from what the image last matched (no seed to compare)
+        @synchronized (r) {
+        const uint8_t *p = nvmtl_buftex_bytes(r);
+        const uint64_t h = p ? nvmtl_buftex_hash(r, p) : 0;
+        if (r->_bufHashed && (!p || h == r->_bufHash)) return;   // unchanged, or only the GPU can change it
         nvmtl_buffer_sync_in(r->_backBuf);   // a no-copy buffer whose pages were not imported is a copy: bring it up first
         if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 1))
-            { static int said; if (said++ < 4) nvlog("buffer texture copy: refill FAILED (%ux%u at offset %lu, bytesPerRow %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff, (unsigned long)r->_backBPR); }
+            { static int said; if (said++ < 4) nvlog("buffer texture copy: refill FAILED (%ux%u at offset %lu, bytesPerRow %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff, (unsigned long)r->_backBPR); return; }
+        r->_bufHash = h; r->_bufHashed = YES;
+        }
         return;
     }
     if (!r->_surf || r->_hostOn) return;   // host-backed: the GPU reads the surface's own pages
@@ -1309,6 +1331,17 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 // off this thread (nvmtl_surface_remark_later).
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
     NVMTLTexture *r = _parent ? _parent : self;
+    if (r->_bufCopy) {   // the GPU drew into the stand-in: its buffer gets the pixels, and the hash what the CPU now sees
+        @synchronized (r) {
+        if (nvmtl_vk_image_host_xfer(r->_q, &r->_i, &r->_backBuf->_b, r->_backOff, r->_backBPR, 0)) {
+            static int said; if (said++ < 4) nvlog("buffer texture copy: write-back FAILED (%ux%u at offset %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backOff);
+            return NO; }
+        nvmtl_buffer_sync_out(r->_backBuf);
+        const uint8_t *p = nvmtl_buftex_bytes(r);
+        if (p) { r->_bufHash = nvmtl_buftex_hash(r, p); r->_bufHashed = YES; }
+        }
+        return YES;
+    }
     if (!r->_surf || r->_hostOn) return YES;   // host-backed: the GPU wrote the surface's own pages
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) { nvtrace("SURFOUT surf %u %ux%u NOT copyable", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h); return NO; }
@@ -2873,6 +2906,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
                 if (ca.loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(cb, sr);
                 else nvmtl_surface_in_for_cb(cb, sr);
                 nvmtl_surf_dirty(cb, sr); }
+            else if (sr->_bufCopy) { if (ca.loadAction != MTLLoadActionClear) nvmtl_surface_in_for_cb(cb, sr); nvmtl_surf_dirty(cb, sr); }
         }
         MTLStoreAction sa = ca.storeAction;
         if ((sa == MTLStoreActionMultisampleResolve || sa == MTLStoreActionStoreAndMultisampleResolve || sa == MTLStoreActionUnknown) && rx) {
@@ -5030,7 +5064,8 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
         if (sr->_surf) {
             if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
             else nvmtl_surface_in_for_cb(self, sr);
-            nvmtl_surf_dirty(self, sr); } }
+            nvmtl_surf_dirty(self, sr); }
+        else if (sr->_bufCopy) { if (d.colorAttachments[0].loadAction != MTLLoadActionClear) nvmtl_surface_in_for_cb(self, sr); nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };
     nvmtl_vk_cmd_set_blend_color(&_c, defaultBlend);
     nvmtl_vk_cmd_set_line_width(&_c, 1.0f);

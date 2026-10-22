@@ -1,7 +1,8 @@
 // buftexprobe: a texture made from a buffer with a row pitch RADV cannot alias (CoreAnimation's 234x18 text line, rows
 // of 960 bytes, at offset 256) must exist and must show what the CPU last wrote into the buffer, before and after a
 // rewrite. Blits the texture into a second buffer and compares. Prints "PASS" or the first difference.
-// Usage: buftexprobe [w h bytesPerRow [a8]]   (a8: an A8Unorm glyph mask, one byte a texel, as CoreText's)
+// Usage: buftexprobe [w h bytesPerRow [a8|rt]]   (a8: an A8Unorm glyph mask, one byte a texel, as CoreText's;
+//        rt: a render target - a cleared pass must land in the buffer's bytes)
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,7 +31,19 @@ int main(int argc, char **argv)
         for (NSUInteger i = 0; i < bpr * h; i++) px[i] = (uint8_t)(i * 2654435761u >> 13);
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:a8 ? MTLPixelFormatA8Unorm : MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
         d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModeShared;
+        const BOOL rt = argc > 4 && !strcmp(argv[4], "rt");
+        if (rt) d.usage |= MTLTextureUsageRenderTarget;
         id<MTLTexture> t = [b newTextureWithDescriptor:d offset:off bytesPerRow:bpr];
+        if (t && rt) {   // the GPU draws (clears) into it: the CPU must then read the colour from the buffer
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+            id<MTLCommandBuffer> cb = [q commandBuffer]; [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            NSUInteger bad = 0;
+            for (NSUInteger y = 0; y < h; y++) for (NSUInteger x = 0; x < w; x++) if (((uint32_t *)(px + y * bpr))[x] != 0xffff0000u) bad++;
+            printf("render target: %lu of %lu texels not red in the buffer\n%s\n", (unsigned long)bad, (unsigned long)(w * h), bad ? "FAIL" : "PASS");
+            return bad != 0;
+        }
         printf("%s: %lux%lu bytesPerRow %lu at offset %lu -> %s\n", dev.name.UTF8String, (unsigned long)w, (unsigned long)h, (unsigned long)bpr, (unsigned long)off, t ? "texture" : "nil");
         if (!t) { printf("FAIL\n"); return 1; }
         int bad = check(dev, q, t, px, w, h, bpr, bpp, "first contents");

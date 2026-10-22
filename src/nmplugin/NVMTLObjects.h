@@ -291,7 +291,9 @@ typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_p
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
 @interface NVMTLTexture () { @public BOOL _bparkable; } @end
-@interface NVMTLTexture () { @public BOOL _bufCopy; } @end   // a private image refilled from _backBuf at each use (no linear alias)
+// a private image standing in for a buffer texture RADV will not alias: refilled from _backBuf when the buffer's bytes
+// change (_bufHash), written back after the GPU draws into it
+@interface NVMTLTexture () { @public BOOL _bufCopy, _bufHashed; uint64_t _bufHash; } @end
 static void nvmtl_heap_park(NVMTLHeap *h, nvk_image *img, const uint32_t *key, NSUInteger off, NSUInteger len);
 void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared);
 @interface NVMTLIndirectCommandBuffer () { @public uint32_t _purge; } @end
