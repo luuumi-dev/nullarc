@@ -73,10 +73,8 @@ reboots within an hour turn acceleration off (remove the trigger, then re-arm).
 
 ## Where things stand
 
-BUGS.md has the full list. Staged on the Mac, waiting for the owner (they could not test overnight):
-- Typed-text fix (B-05) is deployed: ask them to type in Spotlight and Messages.
-- Brightness (B-04): `phxbl <percent>` writes the PWM; ask whether the panel dims. Then install
-  `~/gpu/phxaccel-bl/build/PhxAccel.kext` (brightness slider, `-phxbloff` disables) and BrightnessKeys (`~/gpu/bk`).
-- Audio (B-03): `~/gpu/alc/AppleALC.kext` has its AppleHDA paths moved to `/Library/Extensions`; swap it into
-  `EFI/OC/Kexts` with a backup, then reboot.
-- USB-C lag (B-01, S1): run `usbcap.sh 60` in the background, then ask them to plug the device in.
+BUGS.md has the full list. As of 2026-10-26: sound (AppleALC paths + PhxHDA + `alcid=18`), brightness (both PWM
+generators, `linear-brightness`), display sleep and the audio device names are fixed and confirmed. In progress:
+Geekbench 6 GPU (B-29: MPS kernels the translator rejects; the plugin retries them unrolled), GPU clocks through the
+SMU (`phxctl smu 0x17` reads GFXCLK), then hibernation for the lid (B-08, the owner chose S4). Debug aids still on:
+DEBUG Lilu with `liludump=90`, `alcverbs=1` (EFI config boot-args), `PhxTrace` in PhxAMDFB.

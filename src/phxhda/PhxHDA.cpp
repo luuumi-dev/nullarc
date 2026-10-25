@@ -8,7 +8,7 @@
 //  AppleHDADriver never registered: no sound (2026-10-25). AppleALC already wraps the callbacks those requests name
 //  (AppleHDADriver::layoutLoadCallback, platformLoadCallback) and puts its own layout and platform data in, so the
 //  requests are answered here, from a thread call as kernelmanagerd's answers come, with no data of their own.
-//  -phxhdaoff turns it off.
+//  It also points AppleHDA's device strings at /Library/Extensions. -phxhdaoff turns it off.
 //
 #include <Headers/plugin_start.hpp>
 #include <Headers/kern_api.hpp>
@@ -51,8 +51,23 @@ static OSReturn phxhdaRequestResource(const char *kextIdentifier, const char *re
     return kOSReturnSuccess;
 }
 
+// AppleHDA names the bundle with its device strings relative to /System/Library/Extensions, where Tahoe has none, and
+// the speakers and microphone showed up as "DevShortNameOut" / "DevShortNameIn" (2026-10-25). Its HAL plug-in path
+// is left alone: sound works without it.
+static bool phxhdaPublished(void *, void *, IOService *service, IONotifier *)
+{
+    service->setProperty("IOAudioDeviceLocalizedBundle", "../../../Library/Extensions/AppleHDA.kext");
+    SYSLOG("phxhda", "%s: device strings from /Library/Extensions/AppleHDA.kext", service->getName());
+    return true;
+}
+
 static void phxhdaStart()
 {
+    if (OSDictionary *match = IOService::serviceMatching("AppleHDADriver")) {
+        if (!IOService::addMatchingNotification(gIOFirstPublishNotification, match, phxhdaPublished, nullptr))
+            SYSLOG("phxhda", "no publish notification for AppleHDADriver: device names stay unlocalised");
+        match->release();
+    }
     lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
         KernelPatcher::RouteRequest request("_OSKextRequestResource", phxhdaRequestResource, orgRequestResource);
         if (!patcher.routeMultiple(KernelPatcher::KernelID, &request, 1))
