@@ -640,7 +640,13 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
 // text IR out; nil when the reader or the pass builder is missing or the passes fail.
 static NSString *nvmtl_ir_unrolled(NSString *ir) {
     if (!nvmtl_bitcode_reader_ready() || !nvLLVMRunPasses || !nvLLVMParseIRInContext) return nil;
-    const char *text = ir.UTF8String; if (!text) return nil;
+    // the linker concatenates modules and keeps each one's @llvm.global_ctors, which the translator ignores and LLVM's
+    // reader refuses as a redefinition (MPS's depthwiseConv_3x3, 2026-10-26): the first one stays
+    NSMutableArray<NSString *> *lines = [[ir componentsSeparatedByString:@"\n"] mutableCopy]; BOOL seen = NO;
+    for (NSUInteger i = 0; i < lines.count; i++) if ([lines[i] hasPrefix:@"@llvm.global_ctors = "]) {
+        if (seen) [lines replaceObjectAtIndex:i withObject:@""]; seen = YES;
+    }
+    const char *text = [lines componentsJoinedByString:@"\n"].UTF8String; if (!text) return nil;
     void *context = nvLLVMContextCreate(); if (!context) return nil;
     nvLLVMContextSetDiagnosticHandler(context, nvmtl_llvm_diagnostic, NULL);
     void *buffer = nvLLVMCreateMemoryBufferWithMemoryRangeCopy(text, strlen(text), "nvmtl-linked");
