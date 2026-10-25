@@ -35,3 +35,6 @@ MSDM.dsl
 # Firmware images (VBIOS, ACPI VFCT carrying it) are AMD/OEM copyright with no redistribution grant
 *.rom
 VFCT.bin
+
+# Local agent notes with credentials (see CLAUDE.md)
+CLAUDE.local.md
