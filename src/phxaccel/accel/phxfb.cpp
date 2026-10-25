@@ -316,7 +316,20 @@ public:
         if (!on && !(backlightRead(&fBlSaved) && backlightWrite(0))) return;
         fBlDark = !on;
         if (on) backlightWrite(fBlSaved);
+        fBacklight->setProperty("PhxDark", fBlDark);
         PFBLOG("backlight: display power %s, level %u", on ? "on" : "off", fBlSaved);
+    }
+    bool backlightDark() const { return fBlDark; }
+    // which calls reach the panel, newest first, as the registry property PhxTrace (the brightness slider moved and no
+    // brightness parameter arrived, 2026-10-25); the log does not reach the unified log
+    char fTrace[16][48] = {}; unsigned fTraceN = 0;
+    void trace(const char *what, uint32_t a, uint64_t v) {
+        char line[48]; snprintf(line, sizeof line, "%s %c%c%c%c=0x%llx", what, (char)(a >> 24), (char)(a >> 16), (char)(a >> 8), (char)a,
+                                (unsigned long long)v);
+        if (fTraceN && !strcmp(line, fTrace[(fTraceN - 1) % 16])) return;   // repeats of the last call
+        strlcpy(fTrace[fTraceN++ % 16], line, sizeof fTrace[0]);
+        char all[16 * 48 + 16] = ""; for (unsigned i = 0; i < 16 && i < fTraceN; i++) { strlcat(all, fTrace[(fTraceN - 1 - i) % 16], sizeof all); strlcat(all, "; ", sizeof all); }
+        setProperty("PhxTrace", all);
     }
     // the built-in panel is a TFT: AppleBacklightDisplay then drives it (brightness, dimming), as on a MacBook
     IOReturn getAppleSense(IOIndex idx, UInt32 *senseType, UInt32 *primary, UInt32 *extended, UInt32 *displayType) override {
@@ -398,6 +411,7 @@ public:
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
+        trace("attr", attribute, value);
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
             displayPower(value != 0);
@@ -414,6 +428,7 @@ public:
         return IOFramebuffer::getAttribute(attribute, value);
     }
     IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
+        trace("conn", attribute, value);
         switch (attribute) {
         case kConnectionPower:
             displayPower(value != 0);
@@ -532,18 +547,36 @@ public:
         fFB->backlightRead(&fLevel);
         IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, kBlMax);
         IODisplay::setParameter(params, gIODisplayBrightnessKey, (SInt32)fLevel);
+        // CoreBrightness sets the linear ones, as an Intel MacBook's framebuffer offers them: with "brightness" alone
+        // the slider moved and no parameter ever reached the panel (2026-10-25)
+        const OSSymbol *linear[] = { gIODisplayLinearBrightnessKey, gIODisplayUsableLinearBrightnessKey };
+        for (const OSSymbol *k : linear) { IODisplay::addParameter(params, k, 0, kBlMax); IODisplay::setParameter(params, k, (SInt32)fLevel); }
         display->setProperty(gIODisplayParametersKey, params);
         params->release();
         PFBLOG("backlight: brightness parameter on %s, %u of %u", display->getName(), fLevel, kBlMax);
         return true;
     }
+    // the last parameter set, in the registry: PhxAMDFB's log does not reach the unified log
+    uint32_t fSets = 0;
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
-        if (paramName != gIODisplayBrightnessKey) return false;
+        setProperty("PhxLastParam", const_cast<OSSymbol *>(paramName)); setProperty("PhxLastValue", value, 32); setProperty("PhxSets", ++fSets, 32);
+        fFB->trace(paramName->getCStringNoCopy(), 0x20202020, value);
+        setProperty("PhxDark", fFB->backlightDark());
+        if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey
+            && paramName != gIODisplayUsableLinearBrightnessKey) return false;
         if (!fFB->backlightSet(value)) return false;
         fLevel = value > kBlMax ? kBlMax : value;
         return true;
     }
     bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    IOReturn setProperties(OSObject *properties) override {
+        OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+        if (OSCollectionIterator *it = d ? OSCollectionIterator::withCollection(d) : nullptr) {
+            while (const OSSymbol *k = OSDynamicCast(OSSymbol, it->getNextObject())) fFB->trace(k->getCStringNoCopy(), 0x2a2a2a2a, 0);
+            it->release();
+        }
+        return kIOReturnUnsupported;
+    }
     bool doUpdate() override { return true; }
 };
 OSDefineMetaClassAndStructors(PhxBacklight, IODisplayParameterHandler)
