@@ -56,6 +56,9 @@ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysct
 // Linux's panel_cntl does without DMUB: lock the group, write the active count, unlock, wait for the pending update.
 // tools/phxctl/phxbl does the same from user space. -phxbloff leaves the panel without a brightness control.
 enum : uint32_t { kBlCntl = 0x34c0 + 0x2f19, kBlPeriod = 0x34c0 + 0x2f1b, kBlLock = 0x34c0 + 0x2f1c };
+// The firmware runs both PWM generators, PWRSEQ0 and PWRSEQ1 (+0x6c), at full duty, and PWRSEQ0 alone left the panel's
+// brightness as it was (2026-10-25: eDP DPCD 0x721 says the panel follows its PWM pin): both get the level.
+static constexpr uint32_t kBlSeqs[] = { 0, 0x2f85 - 0x2f19 };
 static constexpr uint32_t kBlMax = 1024;   // the brightness parameter's range
 class PhxAMDFB;
 static IOService *phxBacklightCreate(PhxAMDFB *fb);
@@ -282,19 +285,23 @@ public:
     bool backlightWrite(uint32_t level) {
         if (!fMmio) return false;
         volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
-        const uint32_t pc = r[kBlPeriod], period = pc & 0xffff, bits = (pc >> 16) & 0xf;
-        if (!period || !bits || !(r[kBlCntl] >> 31)) return false;
         if (level > kBlMax) level = kBlMax;
         uint64_t frac = (uint64_t)level * 0x10000 / kBlMax;   // 16.16
         if (level && frac < 0x10000 / 100) frac = 0x10000 / 100;   // above dark, at least 1 % of full duty
-        const uint64_t duty = frac * period;
-        uint32_t cnt = (uint32_t)((duty >> bits) & 0xffff) + (uint32_t)((duty >> (bits - 1)) & 1);
-        if (cnt > 0xffff) cnt = 0xffff;
-        r[kBlLock] = r[kBlLock] | 0x80000000u | 1u;                 // IGNORE_MASTER_LOCK_EN, REG_LOCK
-        r[kBlCntl] = (r[kBlCntl] & ~0xffffu) | cnt;                 // BL_ACTIVE_INT_FRAC_CNT
-        r[kBlLock] = (r[kBlLock] | 0x80000000u) & ~1u;
-        for (int i = 0; i < 100 && (r[kBlLock] & 0x100); i++) IODelay(100);   // REG_UPDATE_PENDING
-        return true;
+        bool any = false;
+        for (uint32_t q : kBlSeqs) {
+            const uint32_t pc = r[kBlPeriod + q], period = pc & 0xffff, bits = (pc >> 16) & 0xf;
+            if (!period || !bits || !(r[kBlCntl + q] >> 31)) continue;
+            const uint64_t duty = frac * period;
+            uint32_t cnt = (uint32_t)((duty >> bits) & 0xffff) + (uint32_t)((duty >> (bits - 1)) & 1);
+            if (cnt > 0xffff) cnt = 0xffff;
+            r[kBlLock + q] = r[kBlLock + q] | 0x80000000u | 1u;                 // IGNORE_MASTER_LOCK_EN, REG_LOCK
+            r[kBlCntl + q] = (r[kBlCntl + q] & ~0xffffu) | cnt;                 // BL_ACTIVE_INT_FRAC_CNT
+            r[kBlLock + q] = (r[kBlLock + q] | 0x80000000u) & ~1u;
+            for (int i = 0; i < 100 && (r[kBlLock + q] & 0x100); i++) IODelay(100);   // REG_UPDATE_PENDING
+            any = true;
+        }
+        return any;
     }
     // Display sleep left the backlight lit over a black or torn frame (2026-10-25). Besides brightness 0, a connection
     // powered down goes dark and gets its level back on power-up; a brightness set while dark waits.
@@ -640,7 +647,7 @@ bool PhxAMDFB::start(IOService *provider)
     setProperty("IOFBDependentIndex", 0ull, 32);
     // the backlight's handler comes first: IOGraphics checks for a "backlight" service once, when the framebuffer opens
     fMmio = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
-    if (fMmio && fMmio->getLength() < (kBlLock + 1) * 4) OSSafeReleaseNULL(fMmio);
+    if (fMmio && fMmio->getLength() < (kBlLock + kBlSeqs[1] + 1) * 4) OSSafeReleaseNULL(fMmio);
     uint32_t bl = 0;
     if (PE_parse_boot_argn("-phxbloff", arg, sizeof arg)) PFBLOG("backlight: -phxbloff, no brightness control");
     else if (!backlightRead(&bl)) PFBLOG("backlight: the PWM is not running (no MMIO view, or off), no brightness control");
