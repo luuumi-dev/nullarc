@@ -2548,10 +2548,13 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = [constants copy]; f->_fname = name; f->_stage = _stages[name];
         f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
     }
+    // a function calling visible functions translates only once they are linked in: asking the translator first cost
+    // ~4.5 minutes on MPS's depthwise convolution before it failed, on every run (failures are not cached, 2026-10-26)
+    const BOOL vref = _airs[name] && nvmtl_needs_visible_link(_airs[name], nil);
     nvmtl_fc_expect_link(1);
-    NSData *spec = nvmtl_translate_with_fc_cached(_airs[name], _stages[name], name, constants, idx, sz, pay, n, &e);
+    NSData *spec = vref ? nil : nvmtl_translate_with_fc_cached(_airs[name], _stages[name], name, constants, idx, sz, pay, n, &e);
     nvmtl_fc_expect_link(0);
-    if (!spec && _airs[name] && nvmtl_needs_visible_link(_airs[name], e)) {
+    if (!spec && _airs[name] && (vref || nvmtl_needs_visible_link(_airs[name], e))) {
         nvlog("newFunctionWithName:constantValues: \"%s\" has visible-function references - DEFERRED to pipeline creation (%zu constant(s))", name.UTF8String, n);
         if (error) *error = nil;
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @"");
