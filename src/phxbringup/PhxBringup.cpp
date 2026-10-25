@@ -24,7 +24,7 @@
 
 #include "PhxNativeABI.h"
 
-#define PHX_KEXT_BUILD 33u
+#define PHX_KEXT_BUILD 34u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -248,6 +248,7 @@ private:
     IOReturn doCtx(IOExternalMethodArguments *a);
     IOReturn doSubmit(IOExternalMethodArguments *a);
     IOReturn doWaitSeq(IOExternalMethodArguments *a);
+    IOReturn doSurfGpuMark(IOExternalMethodArguments *a);
     IOReturn doDbgSmu(IOExternalMethodArguments *a);
     IOReturn doDbgPspRing(IOExternalMethodArguments *a);
     IOReturn doDbgVramRead(IOExternalMethodArguments *a);
@@ -1377,6 +1378,8 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
                                                 IOExternalMethodDispatch *, OSObject *, void *) {
     if (selector == PHXN_SEL_WAITSEQ)
         return doWaitSeq(a);
+    if (selector == PHXN_SEL_SURF_GPU_MARK)   // no client state: a ready mark must not wait behind a submission
+        return doSurfGpuMark(a);
 
     IOLockLock(lock);
     IOReturn r;
@@ -2042,6 +2045,45 @@ void IOAccelPhxNativeClient::flushBos() {
     }
     __asm__ __volatile__("mfence" ::: "memory");
     OSAddAtomic64((SInt64)bytes, &gBosFlushBytes);
+}
+
+// WindowServer's composite marks for PhxAccel: the swap of a surface marked pending waits in NMXAccel until it is marked
+// ready (nvSurfWaitReady), so WindowServer need not wait for each composite itself (commitAndWaitUntilSubmitted held
+// its main thread ~1.7 ms a frame, 2026-10-26). They reached NMXAccel through NVIDIA's RM escape before; here the
+// accelerator's own entry (callPlatformFunction "nvSurfVram", NVRM_ESC_SURF_DIRTY with the GPU-mark plane bit) takes
+// them. The accelerator checks the caller is WindowServer.
+struct PhxSurfShareEsc {   // NVRMSurfShareEsc, src/phxaccel/nvrm_surfshare_abi.h (version 2)
+    uint32_t version, surfaceID, plane, hClient, hSrcClient, hSrcMemory, status, pad;
+    uint64_t size;
+};
+static_assert(sizeof(PhxSurfShareEsc) == 40, "NVRMSurfShareEsc layout");
+IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
+    if (!shape(a, 2, 1, 0, 0))
+        return kIOReturnBadArgument;
+    static IOService *accel;
+    static const OSSymbol *fn;
+    if (!accel) {
+        IOService *s = IOService::copyMatchingService(IOService::serviceMatching("NMXAccel"));
+        if (s && !OSCompareAndSwapPtr(nullptr, s, (void *volatile *)&accel))
+            s->release();
+        if (!accel)
+            return kIOReturnNotFound;
+    }
+    if (!fn) {
+        const OSSymbol *f = OSSymbol::withCStringNoCopy("nvSurfVram");
+        if (f && !OSCompareAndSwapPtr(nullptr, (void *)f, (void *volatile *)&fn))
+            f->release();
+        if (!fn)
+            return kIOReturnNoMemory;
+    }
+    PhxSurfShareEsc e{};
+    e.version = 2;
+    e.surfaceID = static_cast<uint32_t>(a->scalarInput[0]);
+    e.plane = 0x80000000u | (a->scalarInput[1] ? 1u : 0u);   // NVRM_SS_PLANE_GPU_MARK | pending
+    e.status = 0x80000002u;                                    // NVRM_SS_OFF unless the accelerator answers
+    const IOReturn r = accel->callPlatformFunction(fn, false, &e, task, reinterpret_cast<void *>(0xE3), nullptr);   // NVRM_ESC_SURF_DIRTY
+    a->scalarOutput[0] = r == kIOReturnSuccess ? e.status : 0x80000002u;
+    return kIOReturnSuccess;
 }
 
 IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {

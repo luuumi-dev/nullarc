@@ -36,6 +36,8 @@ enum {
     PHXN_SEL_CTX       = 6,
     PHXN_SEL_SUBMIT    = 7,
     PHXN_SEL_WAITSEQ   = 8,
+    PHXN_SEL_SURF_GPU_MARK = 22,   /* in: [0] IOSurface id [1] 1 pending, 0 ready -> out [0] the accelerator's answer (0 taken):
+                                      WindowServer's composite marks, handed to PhxAccel's NMXAccel (nvSurfVram) */
     PHXN_SEL_BOIMPORTHOST = 21,    /* ABI 1.9: in [0] host VA [1] size [2] flags 0 [3] GPU VA 0 -> out [0] handle [1] size [2] 0 [3] bits */
     /* Phoenix-only debug selectors: root, and only with the boot-arg phxdebug=1. */
     PHXN_SEL_DBG_SMU   = 100,  /* in: [0] SMU 13.0.4 message id (allow-list) [1] argument   out: [0] response [1] argument register after */

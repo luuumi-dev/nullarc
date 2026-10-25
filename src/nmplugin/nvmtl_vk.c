@@ -1943,11 +1943,26 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
-// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
+// Without NVK the mark goes through PhxBringup (PHXN_SEL_SURF_GPU_MARK, build 34), which hands it to PhxAccel's
+// accelerator; an older kext refuses the selector and WindowServer keeps waiting for its composites itself.
+static io_connect_t g_phx_mark_conn;
+static pthread_once_t g_phx_mark_once = PTHREAD_ONCE_INIT;
+static void nvmtl_phx_mark_open(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
+    if (!s) return;
+    if (IOServiceOpen(s, mach_task_self(), 0x4E34384Eu, &g_phx_mark_conn) != KERN_SUCCESS) g_phx_mark_conn = 0;
+    IOObjectRelease(s);
+}
+// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape or PhxBringup's: 0 = the kernel took it
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
-    if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
-    return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    if (pnvk_surface_dirty && g_dev) return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    pthread_once(&g_phx_mark_once, nvmtl_phx_mark_open);
+    if (!g_phx_mark_conn) return 0x80000002u;
+    uint64_t in[2] = { surfaceID, pending ? 1u : 0u }, out = 0x80000002u; uint32_t n = 1;
+    if (IOConnectCallScalarMethod(g_phx_mark_conn, 22, in, 2, &out, &n) != KERN_SUCCESS) return 0x80000002u;
+    return (uint32_t)out;
 }
 /* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
 int nvmtl_vk_accel_surface_wait(void)
