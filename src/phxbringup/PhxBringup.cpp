@@ -1731,6 +1731,14 @@ IOReturn IOAccelPhxNativeClient::doDbgSmu(IOExternalMethodArguments *a) {
     case PHX_PPSMC_AllowGfxOff:
     case PHX_PPSMC_DisallowGfxOff:
     case PHX_PPSMC_EnableGfxImu:
+    case PHX_PPSMC_GetGfxclkFrequency:
+    case PHX_PPSMC_GetFclkFrequency:
+    case PHX_PPSMC_SetHardMinGfxClk:
+    case PHX_PPSMC_SetSoftMaxGfxClk:
+    case PHX_PPSMC_SetHardMinFclkByFreq:
+    case PHX_PPSMC_SetSoftMaxFclkByFreq:
+    case PHX_PPSMC_SetHardMinSocclkByFreq:
+    case PHX_PPSMC_SetSoftMaxSocclkByFreq:
         break;
     default:
         return kIOReturnNotPermitted;
