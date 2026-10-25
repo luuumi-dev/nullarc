@@ -278,6 +278,7 @@ public:
         *level = l > kBlMax ? kBlMax : (uint32_t)l;
         return true;
     }
+    // level 0 is dark, as on a MacBook: AppleBacklightDisplay puts the panel to sleep with brightness 0
     bool backlightWrite(uint32_t level) {
         if (!fMmio) return false;
         volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
@@ -285,7 +286,7 @@ public:
         if (!period || !bits || !(r[kBlCntl] >> 31)) return false;
         if (level > kBlMax) level = kBlMax;
         uint64_t frac = (uint64_t)level * 0x10000 / kBlMax;   // 16.16
-        if (frac < 0x10000 / 100) frac = 0x10000 / 100;       // never quite dark: 1 % of full duty at the bottom
+        if (level && frac < 0x10000 / 100) frac = 0x10000 / 100;   // above dark, at least 1 % of full duty
         const uint64_t duty = frac * period;
         uint32_t cnt = (uint32_t)((duty >> bits) & 0xffff) + (uint32_t)((duty >> (bits - 1)) & 1);
         if (cnt > 0xffff) cnt = 0xffff;
@@ -294,6 +295,21 @@ public:
         r[kBlLock] = (r[kBlLock] | 0x80000000u) & ~1u;
         for (int i = 0; i < 100 && (r[kBlLock] & 0x100); i++) IODelay(100);   // REG_UPDATE_PENDING
         return true;
+    }
+    // Display sleep left the backlight lit over a black or torn frame (2026-10-25). Besides brightness 0, a connection
+    // powered down goes dark and gets its level back on power-up; a brightness set while dark waits.
+    bool fBlDark = false;
+    uint32_t fBlSaved = kBlMax;
+    bool backlightSet(uint32_t level) {
+        if (fBlDark) { fBlSaved = level > kBlMax ? kBlMax : level; return true; }
+        return backlightWrite(level);
+    }
+    void displayPower(bool on) {
+        if (!fBacklight || on != fBlDark) return;
+        if (!on && !(backlightRead(&fBlSaved) && backlightWrite(0))) return;
+        fBlDark = !on;
+        if (on) backlightWrite(fBlSaved);
+        PFBLOG("backlight: display power %s, level %u", on ? "on" : "off", fBlSaved);
     }
     // the built-in panel is a TFT: AppleBacklightDisplay then drives it (brightness, dimming), as on a MacBook
     IOReturn getAppleSense(IOIndex idx, UInt32 *senseType, UInt32 *primary, UInt32 *extended, UInt32 *displayType) override {
@@ -377,6 +393,7 @@ public:
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
+            displayPower(value != 0);
             if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
                          return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
             handleEvent(kIOFBNotifyWillPowerOff);
@@ -391,7 +408,10 @@ public:
     }
     IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
         switch (attribute) {
-        case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
+        case kConnectionPower:
+            displayPower(value != 0);
+            return kIOReturnSuccess;
+        case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
         case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported: case kConnectionColorMode:
         case kConnectionDisplayFlags: case kConnectionFlags:
             return kIOReturnSuccess;
@@ -512,7 +532,7 @@ public:
     }
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
         if (paramName != gIODisplayBrightnessKey) return false;
-        if (!fFB->backlightWrite(value)) return false;
+        if (!fFB->backlightSet(value)) return false;
         fLevel = value > kBlMax ? kBlMax : value;
         return true;
     }
