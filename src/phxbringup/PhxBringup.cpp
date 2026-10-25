@@ -19,10 +19,12 @@
 #include <libkern/OSAtomic.h>
 #include <pexpert/pexpert.h>
 #include <sys/sysctl.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 
 #include "PhxNativeABI.h"
 
-#define PHX_KEXT_BUILD 32u
+#define PHX_KEXT_BUILD 33u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -34,6 +36,18 @@ SYSCTL_INT(_debug, OID_AUTO, phxbos_flush, CTLFLAG_RW | CTLFLAG_LOCKED, &gBosFlu
            "BO cache maintenance per submit/wait: 0 none, 1 clflushopt, 2 clflush");
 SYSCTL_QUAD(_debug, OID_AUTO, phxbos_flush_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gBosFlushBytes,
             "bytes of BOs flushed from the CPU caches");
+// debug.phx_hang_ms: a queue holding work whose fence has not moved for this long gets the waves of its oldest
+// submission's VMID killed (Linux's gfx_v11_0_ring_soft_recovery), and every wave if it still stands half as long
+// again; 0 turns it off. One hung app (Geekbench's OpenCL Feature Matching, 2026-10-26) otherwise froze WindowServer
+// until its watchdog took the session down; a spinning wave killed this way by hand freed the queue in place.
+static int gHangMs = 3000;
+static volatile SInt32 gHangKills;
+SYSCTL_INT(_debug, OID_AUTO, phx_hang_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gHangMs, 0,
+           "ms without progress before a hung submission's waves are killed (0 off)");
+SYSCTL_INT(_debug, OID_AUTO, phx_hang_kills, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gHangKills, 0,
+           "hung submissions whose waves were killed");
+// GC 11.0.1 registers (segment 0 base 0x1260, segment 1 base 0xa000)
+static constexpr uint32_t kRegSqCmd = 0x1260 + 0x111b, kRegRlcSafeMode = 0xa000 + 0x0980;
 static volatile UInt32 gSysctlUp;
 
 // psp_gfx_rb_frame (64 B) — the ring entry the PSP reads. Only 5 fields are set; the rest stay zero
@@ -145,7 +159,10 @@ private:
         uint32_t ringOff, ringDw, wbOff, fenceOff;
         uint64_t dbByte, wptr, doneEnd;
         uint64_t fseq[64], fend[64];
+        uint32_t fvmid[64];                     // the hardware VMID each outstanding submission runs under
         volatile uint32_t head, tail;
+        uint64_t lastDone, lastProgress;        // the hang watchdog's view: fence seen last, and when it last moved
+        uint64_t killedSeq; bool killedAll;
     };
     GpuQueue gq[2]{};
     uint64_t gSeq{0};
@@ -181,6 +198,11 @@ private:
     uint64_t *vmPte(VmCtx &c, uint64_t va, bool alloc);
     void vmFlushTlb(uint32_t vmid) const;
     void ringPut(GpuQueue &q, uint32_t idx, uint32_t value);
+    thread_call_t hangCall{nullptr};
+    volatile bool hangStop{false};
+    static void hangTick(thread_call_param_t self, thread_call_param_t);
+    void hangCheck();
+    void killWaves(uint32_t vmid, bool all);
     bool debug{false};
     bool smuUsed{false};
     volatile SInt32 sessionOpen{0};
@@ -311,14 +333,28 @@ bool PhxBringup::start(IOService *provider) {
     setProperty("phx-fb-aper-len", fbAperLen, 64);
     IOLog("PhxBringup: service up (mmio %s, bar0 %s %llu MiB, debug %d)\n", mmio ? "mapped" : "unmapped",
           fbAper ? "mapped" : "unmapped", (unsigned long long)(fbAperLen >> 20), debug);
+    hangCall = thread_call_allocate(hangTick, this);
+    if (hangCall) {
+        uint64_t d;
+        clock_interval_to_deadline(500, kMillisecondScale, &d);
+        thread_call_enter_delayed(hangCall, d);
+    }
     registerService();
     return true;
 }
 
 void PhxBringup::stop(IOService *provider) {
+    if (hangCall) {
+        hangStop = true;   // a tick running now does not arm the next one
+        thread_call_cancel_wait(hangCall);
+        thread_call_free(hangCall);
+        hangCall = nullptr;
+    }
     if (gSysctlUp) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush);
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
+        sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
+        sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
         gSysctlUp = 0;
     }
     clearRing();
@@ -818,6 +854,7 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     q.wptr += k;
     q.fseq[q.tail & 63] = seq;
     q.fend[q.tail & 63] = q.wptr;
+    q.fvmid[q.tail & 63] = vmid;
     __asm__ __volatile__("" ::: "memory");
     q.tail = q.tail + 1;
     // BAR0 is write-combined: drain the WC buffers so the packets are in VRAM before the CP is told about them
@@ -835,6 +872,70 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     IOLockUnlock(gpuLock);
     *seqOut = seq;
     return kIOReturnSuccess;
+}
+
+// Every 500 ms: a queue with unfinished work whose fence has not moved for debug.phx_hang_ms has the waves of its oldest
+// unfinished submission killed, the CP then finishes that submission as if it had ended and the queue moves on.
+void PhxBringup::hangTick(thread_call_param_t self, thread_call_param_t) {
+    PhxBringup *me = static_cast<PhxBringup *>(self);
+    me->hangCheck();
+    if (me->hangStop)
+        return;
+    uint64_t d;
+    clock_interval_to_deadline(500, kMillisecondScale, &d);
+    thread_call_enter_delayed(me->hangCall, d);
+}
+
+void PhxBringup::hangCheck() {
+    const int limitMs = gHangMs;
+    if (limitMs <= 0 || !mmio)
+        return;
+    uint64_t limit, now = mach_absolute_time();
+    nanoseconds_to_absolutetime(static_cast<uint64_t>(limitMs) * 1000000ull, &limit);
+    for (GpuQueue &q : gq) {
+        if (!q.ready)
+            continue;
+        const uint64_t done = queueFence(q);
+        const uint32_t tail = q.tail;
+        uint32_t oldest = 0;
+        bool found = false;
+        for (uint32_t i = q.head; i != tail && !found; i++)
+            if (q.fseq[i & 63] > done) {
+                oldest = i & 63;
+                found = true;
+            }
+        if (!found || done != q.lastDone) {   // idle, or moving: the clock restarts
+            q.lastDone = done;
+            q.lastProgress = now;
+            continue;
+        }
+        if (now - q.lastProgress < limit)
+            continue;
+        if (q.killedSeq != q.fseq[oldest]) {
+            killWaves(q.fvmid[oldest], false);
+            q.killedSeq = q.fseq[oldest];
+            q.killedAll = false;
+            q.lastProgress = now;
+            IOLog("PhxBringup: %s queue stuck %d ms at seq %llu: killed the waves of VMID %u\n", q.gfx ? "gfx" : "compute",
+                  limitMs, static_cast<unsigned long long>(q.fseq[oldest]), q.fvmid[oldest]);
+        } else if (!q.killedAll && now - q.lastProgress >= limit / 2) {
+            killWaves(0, true);
+            q.killedAll = true;
+            IOLog("PhxBringup: %s queue still stuck at seq %llu: killed every wave\n", q.gfx ? "gfx" : "compute",
+                  static_cast<unsigned long long>(q.fseq[oldest]));
+        }
+    }
+}
+
+// gfx_v11_0_ring_soft_recovery: SQ_CMD kill (CMD 3) broadcast (MODE 1), limited to one VMID unless `all`, inside RLC
+// safe mode
+void PhxBringup::killWaves(uint32_t vmid, bool all) {
+    wreg(kRegRlcSafeMode, 0x3);                        // CMD | MESSAGE 1: enter
+    for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
+        IODelay(1);
+    wreg(kRegSqCmd, 0x13u | (all ? 0u : (0x80u | (vmid & 0xfu) << 28)));
+    wreg(kRegRlcSafeMode, 0x1);                        // CMD, MESSAGE 0: exit
+    OSIncrementAtomic(&gHangKills);
 }
 
 IOReturn PhxBringup::doorbellWrite(uint64_t byteOff, uint64_t value) {
@@ -1159,6 +1260,8 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
     if (!gSysctlUp && OSCompareAndSwap(0, 1, &gSysctlUp)) {
         sysctl_register_oid(&sysctl__debug_phxbos_flush);
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
+        sysctl_register_oid(&sysctl__debug_phx_hang_ms);
+        sysctl_register_oid(&sysctl__debug_phx_hang_kills);
     }
     if (type != PHXN_UC_TYPE)
         return kIOReturnBadArgument;
