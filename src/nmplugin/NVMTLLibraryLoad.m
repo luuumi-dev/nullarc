@@ -487,7 +487,6 @@ static void *(*nvLLVMCreatePassBuilderOptions)(void);
 static void (*nvLLVMDisposePassBuilderOptions)(void *);
 static char *(*nvLLVMGetErrorMessage)(void *);
 static void (*nvLLVMDisposeErrorMessage)(char *);
-static int (*nvLLVMParseIRInContext)(void *, void *, void **, char **);
 struct nvmtl_llvm_walk {
     void *(*GetFirstGlobal)(void *); void *(*GetNextGlobal)(void *); void *(*GlobalGetValueType)(void *);
     void *(*GetFirstUse)(void *); void *(*GetNextUse)(void *); void *(*GetUser)(void *);
@@ -582,7 +581,6 @@ static BOOL nvmtl_bitcode_reader_ready(void) {
         nvLLVMRunPasses = dlsym(library, "LLVMRunPasses"); nvLLVMCreatePassBuilderOptions = dlsym(library, "LLVMCreatePassBuilderOptions");
         nvLLVMDisposePassBuilderOptions = dlsym(library, "LLVMDisposePassBuilderOptions");
         nvLLVMGetErrorMessage = dlsym(library, "LLVMGetErrorMessage"); nvLLVMDisposeErrorMessage = dlsym(library, "LLVMDisposeErrorMessage");
-        nvLLVMParseIRInContext = dlsym(library, "LLVMParseIRInContext");   // optional: the linked-kernel retry only
         if (!nvLLVMRunPasses || !nvLLVMCreatePassBuilderOptions || !nvLLVMDisposePassBuilderOptions || !nvLLVMGetErrorMessage || !nvLLVMDisposeErrorMessage) {
             nvLLVMRunPasses = NULL; nvlog("library: air unroll unavailable - libLLVM lacks the pass-builder API"); }
         if (nvLLVMRunPasses && !nvmtl_llvm_walk_load(&gLLVMWalk, library)) {
@@ -630,36 +628,6 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
     }
     if (module) nvLLVMDisposeModule(module);
     if (buffer) nvLLVMDisposeMemoryBuffer(buffer);
-    nvLLVMContextDispose(context);
-    return result;
-}
-
-// The translator cannot merge pointers of different storage: MPS's depthwise convolution picks between a local array
-// and a private constant table through one pointer phi, and Geekbench's GPU run aborted on it (2026-10-25). Unrolled
-// and scalarised by SROA, as simdgroup_matrix modules already are, a kernel like that loses the phi. Text IR in,
-// text IR out; nil when the reader or the pass builder is missing or the passes fail.
-static NSString *nvmtl_ir_unrolled(NSString *ir) {
-    if (!nvmtl_bitcode_reader_ready() || !nvLLVMRunPasses || !nvLLVMParseIRInContext) return nil;
-    // the linker concatenates modules and keeps each one's @llvm.global_ctors, which the translator ignores and LLVM's
-    // reader refuses as a redefinition (MPS's depthwiseConv_3x3, 2026-10-26): the first one stays
-    NSMutableArray<NSString *> *lines = [[ir componentsSeparatedByString:@"\n"] mutableCopy]; BOOL seen = NO;
-    for (NSUInteger i = 0; i < lines.count; i++) if ([lines[i] hasPrefix:@"@llvm.global_ctors = "]) {
-        if (seen) [lines replaceObjectAtIndex:i withObject:@""]; seen = YES;
-    }
-    const char *text = [lines componentsJoinedByString:@"\n"].UTF8String; if (!text) return nil;
-    void *context = nvLLVMContextCreate(); if (!context) return nil;
-    nvLLVMContextSetDiagnosticHandler(context, nvmtl_llvm_diagnostic, NULL);
-    void *buffer = nvLLVMCreateMemoryBufferWithMemoryRangeCopy(text, strlen(text), "nvmtl-linked");
-    void *module = NULL; char *msg = NULL; NSString *result = nil;
-    if (buffer && !nvLLVMParseIRInContext(context, buffer, &module, &msg) && module) {   // the parse owns the buffer
-        void *opts = nvLLVMCreatePassBuilderOptions();
-        void *err = nvLLVMRunPasses(module, NVMTL_AIR_UNROLL_PIPELINE, NULL, opts);
-        nvLLVMDisposePassBuilderOptions(opts);
-        if (err) { char *m = nvLLVMGetErrorMessage(err); nvlog("link: unroll retry FAILED (%s)", m ? m : "?"); if (m) nvLLVMDisposeErrorMessage(m); }
-        else { char *out = nvLLVMPrintModuleToString(module); if (out) { result = @(out); nvLLVMDisposeMessage(out); } }
-    } else if (msg) nvlog("link: unroll retry could not read the linked IR: %s", msg);
-    if (msg) nvLLVMDisposeMessage(msg);
-    if (module) nvLLVMDisposeModule(module);
     nvLLVMContextDispose(context);
     return result;
 }
@@ -2201,13 +2169,6 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
     }
     NSString *te = nil;
     NSData *spv = nvmtl_translate_link_cached(linked, fn->_stage, idx, sz, pay, k2, &te);
-    if (!spv && [te containsString:@"pointer"]) {
-        NSString *unrolled = nvmtl_ir_unrolled(linked), *te2 = nil;
-        NSData *spv2 = unrolled ? nvmtl_translate_link_cached(unrolled, fn->_stage, idx, sz, pay, k2, &te2) : nil;
-        nvlog("link: \"%s\" retried unrolled + sroa: %s%s", fn->_fname.UTF8String, spv2 ? "translated" : "still failed: ",
-              spv2 ? "" : (te2 ?: @"(no unrolled IR)").UTF8String);
-        if (spv2) { spv = spv2; linked = unrolled; }
-    }
     free(idx); free(sz); free(bytes); free(pay);
     if (!spv && dumpDir)
         [(te ?: @"(no reason)") writeToFile:[dumpDir stringByAppendingFormat:@"/%@.err.txt", fn->_fname] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
