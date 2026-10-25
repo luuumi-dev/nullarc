@@ -37,6 +37,7 @@ CLAUDE.local.md (untracked); read it first.
 |---|---|
 | `src/phxbringup` | PhxBringup.kext (OpenCore-injected): GPU bring-up (PSP, SMU, GFX/MES, GART), the user client RADV talks to. Selectors in `PhxNativeABI.h` (2 READREGS, 102 VRAM read, 108 debug register write, needs `phxdebug=1`). |
 | `src/phxaccel` | PhxAccel.kext (Auxiliary KC): NMXAccel accelerator, PhxAMDFB framebuffer (takes the GOP scan-out, VBL timer, display pipe copies frames, backlight PWM handler), PhxAGDC. `build.sh <MacKernelSDK>`. |
+| `src/phxhda` | PhxHDA.kext (Lilu plugin, OpenCore-injected after AppleALC): answers AppleHDA's resource requests in the kernel, since kernelmanagerd here serves no kext outside the system KC. `build.sh <MacKernelSDK> <Lilu source>` (`~/gpu/lilu-sdk/Lilu`). |
 | `src/nmplugin` | The Metal plugin NVMTLDriver.bundle: Metal on Vulkan (RADV). `build.sh` on the Mac, `tools/phxctl/plugdeploy.sh` installs it. Knobs in `PhxGPU/nvmtl/nvrm610.conf`. |
 | `mesa-patches-phoenix` | RADV Darwin patches (Mesa built on the Mac in `~/gpu/mesa`). |
 | `tools/phxctl` | Mac-side control: `phxboot.sh` (boot daemon: bring-up, arming, hang watcher), `full.sh`/`bringup5.sh`, `kinst.sh` (rebuild the Aux KC), `plugdeploy.sh`, `phxbl.c` (backlight), `alc_le_paths.py`, `usbcap.sh`. |
