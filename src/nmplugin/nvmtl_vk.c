@@ -1136,6 +1136,7 @@ static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
 }
 
 #define NVMTL_POOL_BLOCK (32u << 20)
+#define NVMTL_POOL_FIRST (4u << 20)   // a process's first pool block; each next one doubles the pool, up to the block cap
 #define NVMTL_POOL_MAX   (4u << 20)
 #define NVMTL_POOL_KEEP  2
 static size_t g_bar1_bytes; static int g_bar1_off;
@@ -6193,8 +6194,14 @@ size_t nvmtl_vk_allocated_bytes(void) { return g_alloc_bytes; }
  * The upload itself stays synchronous: #96 also deferred the fence wait to overlap uploads, but
  * nvmtl_vk_image_destroy() frees an image and its memory at once, so an app that uploads a surface and frees it
  * (IOSurface-backed textures do) would leave the GPU copying into freed memory. A thread keeps at most
- * NVMTL_UPSTAGE_KEEP bytes between uploads (a 4K BGRA frame); a larger one-off upload frees its buffer afterwards. */
-#define NVMTL_UPSTAGE_KEEP (32u << 20)
+ * nvmtl_upstage_keep() bytes between uploads; a larger one-off upload frees its buffer afterwards. WindowServer keeps a 4K
+ * BGRA frame's worth (32 MiB); every other process 4 MiB, since each thread's kept buffer is wired memory (10-26). */
+static size_t nvmtl_upstage_keep(void)
+{
+    static size_t keep;
+    if (!keep) keep = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? (32u << 20) : (4u << 20);
+    return keep;
+}
 typedef struct { nvk_buffer buf; nvk_cmdbuf cb; } nvmtl_upstage;
 static pthread_key_t g_upstage_key; static pthread_once_t g_upstage_once = PTHREAD_ONCE_INIT;
 static void nvmtl_upstage_free(void *p)
@@ -6288,7 +6295,7 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     const int rc = nvmtl_vk_submit_wait_at(c, "surface upload");
-    if (sl->buf.size > NVMTL_UPSTAGE_KEEP) { nvmtl_vk_buffer_destroy(&sl->buf); memset(&sl->buf, 0, sizeof sl->buf); }
+    if (sl->buf.size > nvmtl_upstage_keep()) { nvmtl_vk_buffer_destroy(&sl->buf); memset(&sl->buf, 0, sizeof sl->buf); }
     return rc;
 }
 
@@ -7668,8 +7675,13 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
     pool_block *blk = *head; size_t off = 0; int got = 0;
     for (; blk; blk = blk->next) if (pool_block_take(blk, len, &off)) { got = 1; break; }
     if (!got) {
+        // Every block is wired system memory, and each Metal process took a whole 32 MiB one for its first small buffer:
+        // ~50 GPU clients held over 1 GiB that way while the Mac ran out of memory (10-26). Blocks start at 4 MiB and
+        // double the pool each time, so a busy process still reaches the cap in a few steps.
+        size_t have = 0; for (pool_block *p = *head; p; p = p->next) have += p->heap.size;
+        const size_t cap = vram ? NVMTL_VPOOL_BLOCK : NVMTL_POOL_BLOCK, bs = have < NVMTL_POOL_FIRST ? NVMTL_POOL_FIRST : have > cap ? cap : have;
         pool_block *nb = calloc(1, sizeof *nb);
-        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
+        if (!nb || (vram ? vpool_heap_create(bs, &nb->heap) : nvmtl_vk_heap_create(bs, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
         nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,
