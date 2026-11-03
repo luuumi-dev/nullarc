@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <b>Metal on AMD Radeon 780M for macOS Tahoe.</b><br>
+  <b>Metal on AMD Radeon 780M (soon also Radeon 740M and 760M) for macOS Tahoe.</b><br>
   GPU bring-up, a display driver WindowServer composites on, and Metal over Vulkan (Mesa RADV)<br>
   for Phoenix / Hawk Point APUs (RDNA 3, GC 11.0.1, gfx1103).
 </p>
