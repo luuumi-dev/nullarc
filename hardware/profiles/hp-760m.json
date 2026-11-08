@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "pci": {"vendor": 4098, "device": 6400, "revision": 202, "subvendor": 4156, "subdevice": 35946},
+  "num_shader_engines": 1,
+  "num_shader_arrays_per_engine": 2,
+  "num_cu_per_sh": 6,
+  "num_rb_pipes": 4,
+  "enabled_rb_pipes_mask": 10,
+  "cu_active_number": 8,
+  "cu_bitmap": [
+    [15, 15, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0]
+  ]
+}
