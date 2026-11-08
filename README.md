@@ -23,6 +23,26 @@
 
 ---
 
+## Radeon 760M fork status
+
+This fork adds the supplied HP Envy x360 16-ad0013dx capture (`1002:1900`, revision
+`ca`, subsystem `103c:8c6a`): 8 active CUs with physical masks `[0x0f, 0x0f]`, six
+physical CU slots per shader array, and enabled RB mask `0x0a`. Captured topology
+is validated and transported to RADV through a versioned kernel query. The patched
+RADV builds and compiles a gfx1103 compute pipeline in the HP mock; the default
+12-CU 780M mock is also checked.
+
+**HP hardware bring-up, GPU execution and Metal acceleration are not verified.**
+This branch keeps that exact HP device in diagnostic-only mode: no reference-machine
+firmware/register writes, queue submission or display takeover. The capture lacks
+IP discovery, memory reservations and firmware validation needed to adapt those
+operations. Existing Firebat runtime claims below are retained as upstream reports.
+
+See [development status and test commands](docs/760M_STATUS.md) and
+[actual source dependency map](docs/760M_ARCHITECTURE.md). Validate the supplied
+profile with `python3 tools/phx_profile.py --check`. Apply Mesa Phoenix patch 0007
+after 0001..0006, or use `tools/mesa_phoenix_topology.py` as its alternative.
+
 ## Status
 
 Measured on the reference machine — Firebat U6C, Ryzen 7 H 255, Radeon 780M, 2560×1600 120 Hz eDP, macOS Tahoe 26.6.2 —

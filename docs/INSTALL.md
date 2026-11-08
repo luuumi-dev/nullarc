@@ -1,5 +1,9 @@
 # Installing nullarc
 
+**760M fork caveat:** the captured HP Envy device is diagnostic-only in this branch.
+The upstream installation and Metal checks below describe Firebat 780M releases;
+they do not establish HP compatibility. Read [760M_STATUS.md](760M_STATUS.md) first.
+
 **English** · [Русский](INSTALL_RU.md)
 
 nullarc is alpha software that runs in the kernel and inside WindowServer. Keep a way back before you start: a second

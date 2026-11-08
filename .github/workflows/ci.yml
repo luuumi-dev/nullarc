@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "codex/radeon-760m-*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -17,7 +17,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang make
+        sudo apt-get install -y clang make libdrm-dev pkg-config
 
     - name: Fetch Phoenix firmware fixtures (linux-firmware)
       run: make fixtures
@@ -36,3 +36,6 @@ jobs:
           echo "::error title=Unit tests failed::${msg}"
         fi
         exit "$status"
+
+    - name: Compile read-only Linux hardware collector
+      run: clang -std=c11 -Wall -Wextra -Werror $(pkg-config --cflags libdrm) tools/linux-profile/collect.c -o build/collect-phx-profile
