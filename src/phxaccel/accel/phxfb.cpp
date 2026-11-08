@@ -1,3 +1,4 @@
+#include "../../amd/phx_hp_760m.h"
 // PhxFB: the 780M's display as an IOFramebuffer that PhxAccel (NMXAccel) composites for WindowServer.
 // Like NullMoth's NMIntelFB (phase 1), it takes over the mode the firmware (GOP) already lit, at boot in place of the
 // firmware framebuffer (IONDRV), and writes nothing to the display engine: the scan-out surface is the boot console's
@@ -459,6 +460,13 @@ static bool takeBootArming()
 
 bool PhxAMDFB::start(IOService *provider)
 {
+    IOPCIDevice *profilePCI = OSDynamicCast(IOPCIDevice, provider);
+    if (profilePCI && phx_topology_matches(&phx_hp_760m,
+            profilePCI->configRead16(0), profilePCI->configRead16(2), profilePCI->configRead8(8),
+            profilePCI->configRead16(0x2c), profilePCI->configRead16(0x2e))) {
+        PFBLOG("captured profile only: HP panel takeover requires validated bring-up");
+        return false;
+    }
     char arg[8];
     if (PE_parse_boot_argn("-phxfboff", arg, sizeof arg)) { PFBLOG("-phxfboff: leaving the firmware framebuffer"); return false; }
     if (!takeBootArming()) { PFBLOG("NVRAM phxfb-boot not set: leaving the firmware framebuffer this boot"); return false; }

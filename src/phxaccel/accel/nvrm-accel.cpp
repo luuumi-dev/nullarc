@@ -1,3 +1,4 @@
+#include "../../amd/phx_hp_760m.h"
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
@@ -635,6 +636,15 @@ public:
     }
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
         { if (nvrm_driver_off()) return false; }
+#ifdef NMX_ACCEL
+        if (IOPCIDevice *p = OSDynamicCast(IOPCIDevice, provider)) {
+            if (phx_topology_matches(&phx_hp_760m, p->configRead16(0), p->configRead16(2),
+                    p->configRead8(8), p->configRead16(0x2c), p->configRead16(0x2e))) {
+                ALOG("HP captured profile: accelerator requires validated native bring-up");
+                return false;
+            }
+        }
+#endif
 #ifdef NMX_ACCEL
         // NMXGPU decides which AMD/Intel GPUs are driven (nmxamd=1 / nmxintel=1 / nullmoth-gpu); this accelerator only
         // starts on a device it has claimed, so a GPU macOS drives itself never gets a second accelerator

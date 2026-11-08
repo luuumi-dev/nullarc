@@ -13,6 +13,8 @@
 #define PHX_NATIVE_ABI_H
 
 #include <stdint.h>
+#include "../amd/phx_topology.h"
+static_assert(sizeof(phx_topology) == 128, "topology wire size");
 
 #define PHXN_UC_TYPE      0x4E34384Eu   /* 'N48N' */
 #define PHXN_ABI_VERSION  1u

@@ -1,13 +1,8 @@
 //
-//  PhxBringup.cpp — Phoenix (Radeon 780M, 1002:1900) bring-up kext, step E1.
-//
-//  Publishes the service the RADV Darwin backend opens (class PhxBringup, user client type 'N48N')
-//  and answers ABI v1 selectors 0..8 with the same rules as Mesa's in-process mock kext
-//  (src/amd/common/darwin/ac_darwin_mock.c): buffers are kernel/user shared system memory,
-//  GPU VA mappings are bookkeeping only, and Submit retires at once without touching the GPU.
-//  E1 proves the IOKit transport end to end; E3/E4 put the GPU behind the same calls.
-//
-//  Boot-arg -phxbringupoff disables it. ReadRegs (MMIO read) is root-only; nothing else touches hardware.
+//  PhxBringup.cpp — Phoenix GPUVM, firmware transport and MES queue submission.
+//  tools/phxctl supplies firmware/power/queue initialization; this kext adopts
+//  the queues. Captured HP 760M topology is diagnostic-only until its IP and
+//  memory layout are validated. No reference-machine writes are allowed there.
 //
 
 #include <IOKit/IOService.h>
@@ -21,8 +16,9 @@
 #include <sys/sysctl.h>
 
 #include "PhxNativeABI.h"
+#include "../amd/phx_hp_760m.h"
 
-#define PHX_KEXT_BUILD 32u
+#define PHX_KEXT_BUILD 33u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -93,6 +89,8 @@ public:
     // user BOs are then mapped into the VMID 8 page table and SUBMIT writes INDIRECT_BUFFERs into the queue's ring.
     IOReturn adoptQueue(const uint64_t in[6]);
     IOReturn claimAccel();
+    bool diagnosticOnly() const { return topology != nullptr; }
+    const phx_topology *capturedTopology() const { return topology; }
     bool gpuReady() const { return gq[0].ready || gq[1].ready; }
     // one GPUVM context (VMID 8..15) per client process: RADV instances allocate VAs independently
     uint32_t vmidAlloc();
@@ -112,6 +110,7 @@ private:
     void readFbLayout();
     void clearRing();
 
+    const phx_topology *topology{nullptr};
     IOPCIDevice *pci{nullptr};
     IOMemoryMap *mmio{nullptr};
     IOLock *smuLock{nullptr};
@@ -217,6 +216,7 @@ private:
 
     IOReturn doHello(IOExternalMethodArguments *a);
     IOReturn doQueryInfo(IOExternalMethodArguments *a);
+    IOReturn doTopology(IOExternalMethodArguments *a);
     IOReturn doReadRegs(IOExternalMethodArguments *a);
     IOReturn doBoCreate(IOExternalMethodArguments *a);
     IOReturn doBoFree(IOExternalMethodArguments *a);
@@ -277,7 +277,16 @@ bool PhxBringup::start(IOService *provider) {
     if (!pci)
         return false;
     pci->retain();
-    {   // the GPU must be a bus master before it can DMA to/from system memory (page tables, user BOs)
+    if (phx_topology_matches(&phx_hp_760m, pci->configRead16(0), pci->configRead16(2),
+            pci->configRead8(8), pci->configRead16(0x2c), pci->configRead16(0x2e))) {
+        topology = &phx_hp_760m;
+        setProperty("phx-profile", "hp-760m");
+        setProperty("phx-profile-source", "captured-drm-not-live");
+        setProperty("phx-bringup-blocker", "HP IP discovery, memory layout and firmware validation required");
+        pci->setProperty("phx-diagnostic-only", kOSBooleanTrue);
+        IOLog("PhxBringup: stage PCI/profile OK: HP 760M, 8 captured CUs; hardware writes disabled\n");
+    }
+    if (!diagnosticOnly()) {   // the GPU must be a bus master before it can DMA to/from system memory (page tables, user BOs)
         uint16_t cmd = pci->configRead16(kIOPCIConfigCommand);
         setProperty("phx-pci-cmd-before", cmd, 16);
         pci->setBusMasterEnable(true);
@@ -305,7 +314,7 @@ bool PhxBringup::start(IOService *provider) {
         setProperty("phx-hdp-flush-dword", hdpFlushDword, 32);
     }
     setProperty("phx-build", PHX_KEXT_BUILD, 32);
-    setProperty("phx-stage", "E3");
+    setProperty("phx-stage", diagnosticOnly() ? "profile-diagnostic-only" : "E3");
     setProperty("phx-debug", debug);
     setProperty("phx-fb-aper-phys", fbAperPhys, 64);
     setProperty("phx-fb-aper-len", fbAperLen, 64);
@@ -363,27 +372,38 @@ void PhxBringup::stop(IOService *provider) {
 }
 
 uint32_t PhxBringup::rreg(uint32_t reg) const {
+    if (!mmio || reg >= mmio->getLength() / sizeof(uint32_t)) return 0xFFFFFFFFu;
     return reinterpret_cast<volatile uint32_t *>(mmio->getVirtualAddress())[reg];
 }
 
 void PhxBringup::wreg(uint32_t reg, uint32_t value) const {
+    if (!mmio || reg >= mmio->getLength() / sizeof(uint32_t)) return;
     reinterpret_cast<volatile uint32_t *>(mmio->getVirtualAddress())[reg] = value;
 }
 
 // FB location (MC, 16 MiB units, FB_BASE bits 23:0) and the system physical address of the carve-out (FB_OFFSET << 24).
 void PhxBringup::readFbLayout() {
-    uint32_t base = rreg(PHX_MMMC_VM_FB_LOCATION_BASE) & 0x00FFFFFF;
-    uint32_t top = rreg(PHX_MMMC_VM_FB_LOCATION_TOP) & 0x00FFFFFF;
+    uint32_t base = rreg(PHX_MMMC_VM_FB_LOCATION_BASE);
+    uint32_t top = rreg(PHX_MMMC_VM_FB_LOCATION_TOP);
+    uint32_t offset = rreg(PHX_MMMC_VM_FB_OFFSET);
+    if (base == 0xffffffffu || top == 0xffffffffu || offset == 0xffffffffu) {
+        setProperty("phx-memory-status", "unreadable");
+        IOLog("PhxBringup: stage memory-layout failed: unreadable MMHUB registers\n");
+        return;
+    }
+    base &= 0x00ffffffu; top &= 0x00ffffffu;
     fbMcBase = static_cast<uint64_t>(base) << 24;
     fbSize = top >= base ? (static_cast<uint64_t>(top - base) + 1) << 24 : 0;
-    fbPhys = static_cast<uint64_t>(rreg(PHX_MMMC_VM_FB_OFFSET)) << 24;
+    fbPhys = static_cast<uint64_t>(offset) << 24;
     setProperty("phx-fb-mc-base", fbMcBase, 64);
     setProperty("phx-fb-size", fbSize, 64);
     setProperty("phx-fb-phys", fbPhys, 64);
     // About This Mac / System Information name the GPU from the PCI device's "model" and size its memory from
     // "VRAM,totalMB"; without them the 780M read "Display, 15 MB" (the boot framebuffer)
-    static const char kModel[] = "AMD Radeon 780M";
-    if (OSData *m = OSData::withBytes(kModel, sizeof(kModel))) {
+    static const char hpModel[] = "AMD Radeon 760M", legacyModel[] = "AMD Radeon 780M";
+    const char *model = diagnosticOnly() ? hpModel : legacyModel;
+    const unsigned modelSize = diagnosticOnly() ? sizeof(hpModel) : sizeof(legacyModel);
+    if (OSData *m = OSData::withBytes(model, modelSize)) {
         pci->setProperty("model", m);
         m->release();
     }
@@ -684,7 +704,7 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
 // PhxAccel (the NullMoth accelerator in its AMD configuration) starts only on a GPU marked as driven; matching is
 // re-run so the accelerator personality, refused at boot, is offered the device again.
 IOReturn PhxBringup::claimAccel() {
-    if (!pci || !gpuReady())
+    if (diagnosticOnly() || !pci || !gpuReady())
         return kIOReturnNotReady;
     pci->setProperty("nmxgpu-claimed", kOSBooleanTrue);
     pci->registerService();
@@ -1272,6 +1292,9 @@ static bool shape(const IOExternalMethodArguments *a, uint32_t sin, uint32_t sou
 
 IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
                                                 IOExternalMethodDispatch *, OSObject *, void *) {
+    // Enforced before WAITSEQ's separate locking and before debug handlers.
+    if (owner->diagnosticOnly() && !phx_topology_diagnostic_selector(selector))
+        return kIOReturnNotReady;
     if (selector == PHXN_SEL_WAITSEQ)
         return doWaitSeq(a);
 
@@ -1283,6 +1306,7 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
         switch (selector) {
         case PHXN_SEL_HELLO:     r = doHello(a); break;
         case PHXN_SEL_QUERYINFO: r = doQueryInfo(a); break;
+        case PHX_SEL_TOPOLOGY: r = doTopology(a); break;
         case PHXN_SEL_READREGS:  r = doReadRegs(a); break;
         case PHXN_SEL_BOCREATE:  r = doBoCreate(a); break;
         case PHXN_SEL_BOFREE:    r = doBoFree(a); break;
@@ -1326,6 +1350,15 @@ IOReturn IOAccelPhxNativeClient::doHello(IOExternalMethodArguments *a) {
     return kIOReturnSuccess;
 }
 
+IOReturn IOAccelPhxNativeClient::doTopology(IOExternalMethodArguments *a) {
+    if (!shape(a, 0, 0, 0, sizeof(phx_topology)))
+        return kIOReturnBadArgument;
+    const phx_topology *p = owner->capturedTopology();
+    if (!p) return kIOReturnUnsupported; // Preserve legacy 780M fallback.
+    bcopy(p, a->structureOutput, sizeof(*p));
+    return kIOReturnSuccess;
+}
+
 IOReturn IOAccelPhxNativeClient::doQueryInfo(IOExternalMethodArguments *a) {
     if (!shape(a, 0, 0, 0, sizeof(phxn_info)))
         return kIOReturnBadArgument;
@@ -1334,7 +1367,7 @@ IOReturn IOAccelPhxNativeClient::doQueryInfo(IOExternalMethodArguments *a) {
     inf.abi_version = PHXN_ABI_VERSION;
     inf.kext_build = PHX_KEXT_BUILD;
     inf.reserved[2] = PHXN_ABI_MINOR;
-    inf.flags = PHXN_INFO_S1B_POSITIVE | PHXN_INFO_NATIVE_BOOT;
+    inf.flags = owner->diagnosticOnly() ? 0 : PHXN_INFO_S1B_POSITIVE | PHXN_INFO_NATIVE_BOOT;
     inf.vmid = PHXN_VMID;
     inf.gb_addr_config = kGbAddrConfig;
     inf.gc_version = kGcVersion;

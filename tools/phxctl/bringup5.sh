@@ -4,6 +4,10 @@
 # the offsets and sizes of linux-firmware's gc_11_0_1/psp_13_0_4 files. Run as root (phxboot) or as a user with sudo.
 # A reboot is armed for 3 minutes in case the PSP hangs and cancelled at the end.
 set -u
+if ioreg -rc PhxBringup -l | grep -q '"phx-stage" = "profile-diagnostic-only"'; then
+    echo "HP profile captured; IP discovery, firmware and memory layout validation required. Bring-up stopped." >&2
+    exit 1
+fi
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
 P(){ $SUDO ~/gpu/phxctl/phxctl "$@"; }
 echo "== watchdog: reboot in 3 min unless cancelled =="

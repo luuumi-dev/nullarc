@@ -11,6 +11,10 @@ LOG=/var/log/phxboot.log; MARK=/var/db/phxboot.pending; OFF=$G/phxboot-off
 ALLOW=/Library/GPUBundles/nvmtl-allow.txt; DR=/Library/Logs/DiagnosticReports
 exec >>"$LOG" 2>&1
 echo "== $(date '+%F %T') phxboot"
+if ioreg -rc PhxBringup -l | grep -q '"phx-stage" = "profile-diagnostic-only"'; then
+    echo "HP diagnostic-only profile: leaving GPU initialization and panel arming disabled"
+    exit 0
+fi
 release() { sysctl -w debug.phxfb_hold=0 >/dev/null 2>&1; }
 apps_only() { printf '# phxboot: Metal for the built-in test tools only\n' > $ALLOW; }
 # every process gets the Metal device; WindowServer too once the accelerator is armed (NullMoth's own default list).
