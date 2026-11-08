@@ -1,0 +1,341 @@
+From 6b2f230f88c03c0759f9e20e67bacc2e52946c28 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 8 Nov 2026 10:13:52 -0500
+Subject: [PATCH] radv/darwin: transport captured Phoenix topology and preserve
+ legacy defaults
+
+---
+ src/amd/common/darwin/ac_darwin_drm.c      | 49 +++++++++++++++++++-
+ src/amd/common/darwin/ac_darwin_drm.h      |  2 +
+ src/amd/common/darwin/ac_darwin_kext.c     | 10 +++++
+ src/amd/common/darwin/ac_darwin_kext.h     |  2 +
+ src/amd/common/darwin/ac_darwin_mock.c     | 10 +++++
+ src/amd/common/darwin/phx_hp_760m.h        | 20 +++++++++
+ src/amd/common/darwin/phx_topology.h       | 52 ++++++++++++++++++++++
+ src/amd/common/darwin/test/acd_kext_test.c |  2 +-
+ src/amd/vulkan/radv_physical_device.c      | 11 +++++
+ 9 files changed, 155 insertions(+), 3 deletions(-)
+ create mode 100644 src/amd/common/darwin/phx_hp_760m.h
+ create mode 100644 src/amd/common/darwin/phx_topology.h
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 317d4e4..b74803e 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -6,6 +6,7 @@
+ 
+ #include "ac_darwin_drm.h"
+ #include "ac_darwin_kext.h"
++#include "phx_hp_760m.h"
+ #include "ac_darwin_budget.h"
+ 
+ #include <errno.h>
+@@ -59,6 +60,7 @@ struct amdgpu_bo {
+  * device to go closes the connection. */
+ struct acd_core {
+    int refcount;
++   struct phx_topology topology; /* captured, not live fuse discovery */
+    uint32_t minor; /* ABI minor the kernel reported */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
+    struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
+@@ -148,7 +150,7 @@ env_is_1(const char *name)
+ 
+ /* Hello, live checks and the info snapshot; every failure is one clear stderr line. */
+ static int
+-acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned, uint32_t *minor_out)
++acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned, uint32_t *minor_out, struct phx_topology *topology)
+ {
+    struct acd_hello h;
+    int r = acd_kext_hello(kext, &h);
+@@ -174,6 +176,19 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+       return r;
+    }
+ 
++   r = acd_kext_query_topology(kext, topology);
++   if (r == -EINVAL) {
++      /* Old PhxBringup/Navi48 or mock without a profile: unchanged canned path. */
++      memset(topology, 0, sizeof(*topology));
++   } else if (r) {
++      fprintf(stderr, "radv-darwin: invalid topology query (%d)\n", r);
++      return r;
++   } else if (strcmp(canned->name, "phoenix") || topology->num_shader_arrays_per_engine > 2 ||
++              (!(topology->flags & PHX_TOPOLOGY_RUNTIME_READY) && !env_is_1("RADV_DARWIN_MOCK"))) {
++      fprintf(stderr, "radv-darwin: captured topology is not validated native GPU initialization\n");
++      return -ENODEV;
++   }
++
+    /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. QueryInfo carries the live value
+     * (n48n_info.gb_addr_config); ReadRegs is root-only and refused for a user-application (G4 APP) session, so it is
+     * only the fallback for a kernel that left the field 0. */
+@@ -238,7 +253,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+    if (!host_bo) {
+       int r = acd_kext_open(&c->kext);
+       if (r == 0)
+-         r = acd_native_handshake(c->kext, canned, &c->minor);
++         r = acd_native_handshake(c->kext, canned, &c->minor, &c->topology);
+       if (r) {
+          acd_kext_destroy(c->kext);
+          pthread_mutex_destroy(&c->bo_lock);
+@@ -363,6 +378,10 @@ acd_device_get_sync_provider(acd_device_handle dev)
+ const char *
+ acd_get_marketing_name(acd_device_handle dev)
+ {
++   const struct phx_topology *p = &dev->core->topology;
++   if (phx_topology_matches(p, phx_hp_760m.vendor, phx_hp_760m.device, phx_hp_760m.revision, phx_hp_760m.subvendor, phx_hp_760m.subdevice))
++      return "AMD Radeon 760M Graphics";
++   if (p->version) return "AMD Phoenix captured profile";
+    if (!strcmp(dev->canned->name, "phoenix"))
+       return "AMD Radeon 780M Graphics";
+    return ACD_MARKETING_NAME;
+@@ -506,6 +525,18 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+       *di = d->dev;
+       if (!strcmp(d->name, "phoenix"))
+          di->device_id = 0x1900; /* Hawk Point 780M; same gfx1103 silicon as the canned 0x15bf */
++      const struct phx_topology *p = &dev->core->topology;
++      if (p->version) {
++         di->device_id = p->device;
++         di->pci_rev = p->revision;
++         di->num_shader_engines = p->num_shader_engines;
++         di->num_shader_arrays_per_engine = p->num_shader_arrays_per_engine;
++         di->num_cu_per_sh = p->num_cu_per_sh;
++         di->num_rb_pipes = p->num_rb_pipes;
++         di->enabled_rb_pipes_mask = p->enabled_rb_pipes_mask;
++         di->cu_active_number = p->cu_active_number;
++         memcpy(di->cu_bitmap, p->cu_bitmap, sizeof(di->cu_bitmap));
++      }
+       return 0;
+    }
+    case AMDGPU_INFO_MEMORY:
+@@ -975,3 +1006,17 @@ acd_create_bo_from_user_mem(acd_device_handle dev, void *cpu, uint64_t size, amd
+    *bo = b;
+    return 0;
+ }
++
++/* Enumeration needs PCI identity before radv_physical_device_try_create. Query
++ * the same core as DEV_INFO; never infer a GPU model from the PCI device alone. */
++int
++acd_profile_identity(struct phx_topology *out)
++{
++   acd_device_handle dev;
++   uint32_t major, minor;
++   int r = acd_device_initialize(&major, &minor, &dev);
++   if (r) return r;
++   *out = dev->core->topology;
++   acd_device_deinitialize(dev);
++   return 0;
++}
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+index 1db9014..3a559be 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.h
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -19,6 +19,7 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include "phx_topology.h"
+ 
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "amdgpu.h"
+@@ -43,6 +44,7 @@ struct acd_kext;
+ struct acd_kext *acd_device_kext(acd_device_handle dev, uint32_t *abi_minor);
+ 
+ const char *acd_get_marketing_name(acd_device_handle dev);
++int acd_profile_identity(struct phx_topology *out);
+ int acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value);
+ int acd_va_range_alloc(acd_device_handle dev, enum amdgpu_gpu_va_range va_range_type,
+                        uint64_t size, uint64_t va_base_alignment, uint64_t va_base_required,
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index bdac135..08e6ac0 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -678,3 +678,13 @@ acd_kext_scan_release(struct acd_kext *k, uint64_t out[2])
+    int r = kcall(k, ACD_SEL_SCAN_RELEASE, NULL, 0, NULL, 0, out, &nout, NULL, NULL);
+    return r ? r : (nout == 2 ? 0 : -EIO);
+ }
++
++int
++acd_kext_query_topology(struct acd_kext *k, struct phx_topology *out)
++{
++   size_t size = sizeof(*out);
++   memset(out, 0, size);
++   int r = kcall(k, PHX_SEL_TOPOLOGY, NULL, 0, NULL, 0, NULL, NULL, out, &size);
++   if (r) return r;
++   return size == sizeof(*out) && phx_topology_valid(out) ? 0 : -EPROTO;
++}
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index eee3a5c..ecca7c8 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -17,6 +17,7 @@
+ 
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "navi48_native_abi.h"
++#include "phx_topology.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -130,6 +131,7 @@ struct acd_hello {
+ 
+ int acd_kext_hello(struct acd_kext *k, struct acd_hello *out);
+ int acd_kext_query_info(struct acd_kext *k, struct n48n_info *info);
++int acd_kext_query_topology(struct acd_kext *k, struct phx_topology *out);
+ int acd_kext_read_regs(struct acd_kext *k, uint32_t dword_offset, uint32_t count, uint32_t *vals);
+ 
+ struct acd_bo_created {
+diff --git a/src/amd/common/darwin/ac_darwin_mock.c b/src/amd/common/darwin/ac_darwin_mock.c
+index 240f202..0925ea1 100644
+--- a/src/amd/common/darwin/ac_darwin_mock.c
++++ b/src/amd/common/darwin/ac_darwin_mock.c
+@@ -15,6 +15,7 @@
+ 
+ #include "ac_darwin_kext.h"
+ #include "ac_darwin_drm.h"
++#include "phx_hp_760m.h"
+ 
+ #include <errno.h>
+ #include <pthread.h>
+@@ -636,6 +637,15 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       *stoutsz = sizeof(inf);
+       break;
+    }
++   case PHX_SEL_TOPOLOGY: {
++      const char *profile = getenv("RADV_DARWIN_MOCK_PROFILE");
++      if (!profile || !*profile) { kr = ACD_KR_UNSUPPORTED; goto out; }
++      if (strcmp(profile, "hp-760m")) { kr = ACD_KR_NOT_PERMITTED; goto out; }
++      NEED(shape(0, 0, 0, sizeof(struct phx_topology)));
++      memcpy(stout, &phx_hp_760m, sizeof(phx_hp_760m));
++      *stoutsz = sizeof(phx_hp_760m);
++      break;
++   }
+    case ACD_SEL_READ_REGS: {
+       NEED(nsin == 3 && nout_cap == 0 && stinsz == 0);
+       NEED(sin[1] >= 1 && sin[1] <= 16 && sin[2] == 0xFFFFFFFFull && shape(3, 0, 0, sin[1] * 4));
+diff --git a/src/amd/common/darwin/phx_hp_760m.h b/src/amd/common/darwin/phx_hp_760m.h
+new file mode 100644
+index 0000000..551b498
+--- /dev/null
++++ b/src/amd/common/darwin/phx_hp_760m.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: MIT
++ * Generated by tools/phx_profile.py; source: hardware/profiles/hp-760m.json.
++ * User-supplied capture, not live fuse discovery or verified bring-up.
++ */
++#ifndef PHX_HP_760M_H
++#define PHX_HP_760M_H
++#include "phx_topology.h"
++static const struct phx_topology phx_hp_760m = {
++    PHX_TOPOLOGY_VERSION, PHX_TOPOLOGY_CAPTURED,
++    0x1002u, 0x1900u, 0xcau, 0x103cu, 0x8c6au,
++    1u, 2u, 6u, 4u, 10u, 8u,
++    {
++        {0xfu, 0xfu, 0x0u, 0x0u},
++        {0x0u, 0x0u, 0x0u, 0x0u},
++        {0x0u, 0x0u, 0x0u, 0x0u},
++        {0x0u, 0x0u, 0x0u, 0x0u}
++    },
++    {0, 0, 0}
++};
++#endif
+diff --git a/src/amd/common/darwin/phx_topology.h b/src/amd/common/darwin/phx_topology.h
+new file mode 100644
+index 0000000..3312c80
+--- /dev/null
++++ b/src/amd/common/darwin/phx_topology.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: MIT
++ * Captured DRM topology, shared by the kext and RADV. No register/fuse encoding.
++ * Private selector 30 does not overlap N48N scanout selectors 9..26.
++ */
++#ifndef PHX_TOPOLOGY_H
++#define PHX_TOPOLOGY_H
++#include <stdint.h>
++#define PHX_SEL_TOPOLOGY 30u
++#define PHX_TOPOLOGY_VERSION 1u
++#define PHX_TOPOLOGY_CAPTURED 1u
++/* Captured metadata alone never establishes readiness. */
++#define PHX_TOPOLOGY_RUNTIME_READY 2u
++struct phx_topology {
++    uint32_t version, flags;
++    uint32_t vendor, device, revision, subvendor, subdevice;
++    uint32_t num_shader_engines, num_shader_arrays_per_engine, num_cu_per_sh;
++    uint32_t num_rb_pipes, enabled_rb_pipes_mask, cu_active_number;
++    uint32_t cu_bitmap[4][4];
++    uint32_t reserved[3];
++};
++static inline int phx_topology_valid(const struct phx_topology *p) {
++    if (!p || p->version != PHX_TOPOLOGY_VERSION || !(p->flags & PHX_TOPOLOGY_CAPTURED) ||
++        (p->flags & ~(PHX_TOPOLOGY_CAPTURED | PHX_TOPOLOGY_RUNTIME_READY)) ||
++        p->vendor != 0x1002 || p->device > 0xffff || p->revision > 0xff ||
++        p->subvendor > 0xffff || p->subdevice > 0xffff ||
++        !p->num_shader_engines || p->num_shader_engines > 4 ||
++        !p->num_shader_arrays_per_engine || p->num_shader_arrays_per_engine > 4 ||
++        !p->num_cu_per_sh || p->num_cu_per_sh > 32 ||
++        !p->num_rb_pipes || p->num_rb_pipes > 32 || !p->enabled_rb_pipes_mask ||
++        p->reserved[0] || p->reserved[1] || p->reserved[2]) return 0;
++    uint32_t cu_mask = 0xffffffffu >> (32 - p->num_cu_per_sh);
++    uint32_t rb_mask = 0xffffffffu >> (32 - p->num_rb_pipes);
++    if (p->enabled_rb_pipes_mask & ~rb_mask) return 0;
++    uint32_t count = 0;
++    for (unsigned se = 0; se < 4; ++se) for (unsigned sa = 0; sa < 4; ++sa) {
++        uint32_t m = p->cu_bitmap[se][sa];
++        if (m & ~cu_mask) return 0;
++        if ((se >= p->num_shader_engines || sa >= p->num_shader_arrays_per_engine) && m) return 0;
++        while (m) { m &= m - 1; ++count; }
++    }
++    return count && count == p->cu_active_number;
++}
++static inline int phx_topology_matches(const struct phx_topology *p, uint32_t vendor,
++    uint32_t device, uint32_t revision, uint32_t subvendor, uint32_t subdevice) {
++    return p && p->vendor == vendor && p->device == device && p->revision == revision &&
++        p->subvendor == subvendor && p->subdevice == subdevice;
++}
++static inline int phx_topology_diagnostic_selector(uint32_t selector) {
++    return selector == 0 || selector == 1 || selector == 2 ||
++           selector == PHX_SEL_TOPOLOGY || selector == 102;
++}
++#endif
+diff --git a/src/amd/common/darwin/test/acd_kext_test.c b/src/amd/common/darwin/test/acd_kext_test.c
+index f779934..bf85224 100644
+--- a/src/amd/common/darwin/test/acd_kext_test.c
++++ b/src/amd/common/darwin/test/acd_kext_test.c
+@@ -441,7 +441,7 @@ test_import_host(void)
+ static void
+ test_service_class(void)
+ {
+-   CHECK(strcmp(acd_kext_service_class(), "Navi48Bringup") == 0); /* the default is unchanged */
++   CHECK(strcmp(acd_kext_service_class(), "PhxBringup") == 0); /* Phoenix patch 0003 changes the default */
+    CHECK(acd_kext_set_service_class("Navi48Accelerator") == 0);
+    CHECK(strcmp(acd_kext_service_class(), "Navi48Accelerator") == 0);
+    CHECK(acd_kext_set_service_class("Navi48Bringup") == 0);
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 375c65e..ad0bbd6 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2988,6 +2988,7 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
+ }
+ 
+ #ifdef HAVE_AMDGPU_DARWIN
++#include "common/darwin/ac_darwin_drm.h"
+ /* macOS has no DRM devices to enumerate.  The one GPU is described by the
+  * Darwin ac_drm backend, which needs the Navi48 kext's native client (or the
+  * RADV_DARWIN_MOCK=1 / RADV_DARWIN_HOST_BO=1 stand-ins).  If the backend cannot
+@@ -3017,6 +3018,16 @@ radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
+       device_info.subdevice_id = 0x0000;
+       device_info.revision_id = 0xC0;
+    }
++   struct phx_topology profile = {0};
++   int profile_result = acd_profile_identity(&profile);
++   if (profile_result) return VK_SUCCESS; /* backend has logged the reason */
++   if (profile.version) {
++      device_info.vendor_id = profile.vendor;
++      device_info.device_id = profile.device;
++      device_info.subvendor_id = profile.subvendor;
++      device_info.subdevice_id = profile.subdevice;
++      device_info.revision_id = profile.revision;
++   }
+    drmDevice drm_device = {
+       .nodes = nodes,
+       .available_nodes = 0,
+-- 
+2.50.1 (Apple Git-155)
+
