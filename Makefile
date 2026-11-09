@@ -10,7 +10,8 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_rdna3_ucode \
         $(TEST_BIN_DIR)/test_r3n_abi \
         $(TEST_BIN_DIR)/test_phx_topology \
-        $(TEST_BIN_DIR)/test_wait_seq
+        $(TEST_BIN_DIR)/test_wait_seq \
+        $(TEST_BIN_DIR)/test_panel_timing
 
 .PHONY: all test clean kext fixtures
 
@@ -54,3 +55,6 @@ kext:
 
 clean:
 	rm -rf build/
+
+$(TEST_BIN_DIR)/test_panel_timing: src/phxaccel/tests/panel_timing.cpp src/phxaccel/accel/phx_panel_timing.h | $(TEST_BIN_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@
