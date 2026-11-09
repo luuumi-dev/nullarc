@@ -2130,6 +2130,11 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     return (NSUInteger)v;
 }
 
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)fmt {
+    (void)fmt;
+    return 256;
+}
+
 - (MTLReadWriteTextureTier)readWriteTextureSupport { return MTLReadWriteTextureTier2; }
 
 - (BOOL)areRasterOrderGroupsSupported { return NO; }
