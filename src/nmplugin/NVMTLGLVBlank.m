@@ -28,7 +28,7 @@ typedef struct _CAImageQueue *NVGLVBLQueueRef;
 struct nvglvbl_info { uint64_t host_time; double seconds; float rate; };
 enum { NVGLVBL_ENTRIES = 4 };   // as many as synchronize asks for (and the window server writes)
 #define NVGLVBL_MARKER "correctsVBlankWaitByDisplayPeriod"
-#define NVGLVBL_WINDOW_RECHECK_S 1.0   // a window's display is looked up again after this (it may have moved)
+#define NVGLVBL_WINDOW_RECHECK_S 30.0   // a window's display is looked up again after this (avoid IPC in render loop)
 enum { NVGLVBL_WINDOW_CACHE = 8 };      // windows whose display's period is remembered
 
 static struct {
@@ -140,6 +140,15 @@ static void nvglvbl_synchronize(id self, SEL cmd)
 
     NVGLVBLQueueRef queue = *(NVGLVBLQueueRef *)(surface + gGLVBL.queue_ivar);
     if (!queue || !gGLVBL.unconsumed(queue, 0, 0)) return;   // the window server has the previous frame: no wait
+
+    // Fast retry: WindowServer often completes consumer handoff within 100-500 us.
+    // Avoid dropping directly into a multi-millisecond quantum wait that halves FPS in 60 Hz locked games.
+    for (int retry = 0; retry < 4; retry++) {
+        struct timespec ts = { 0, 200000 };   // 200 us
+        nanosleep(&ts, NULL);
+        if (!gGLVBL.unconsumed(queue, 0, 0)) return;
+    }
+
     struct nvglvbl_info info[NVGLVBL_ENTRIES];
     const uint32_t n = gGLVBL.vbl_info(queue, info, NVGLVBL_ENTRIES);
     // the entries are the window server's vblank plus 1..n times the spacing CoreAnimation took for the period: with a

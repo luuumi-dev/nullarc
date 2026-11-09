@@ -1039,18 +1039,30 @@ static int gIopSse = 0;   // debug.nvaccel_iop_sse
 // used here are saved first and put back after (WindowServer hung four times in a row while the first version, without
 // this, was on; not proven to be the cause).
 // bytes: a non-zero multiple of 64; src and dst 16-byte aligned. l10r narrows ARGB2101010 to XRGB8888 on the way.
+static inline void nvIopSSEBegin(uint8_t *save)
+{
+    __asm__ __volatile__(
+        "movdqa %%xmm0, 0(%0)\n\t" "movdqa %%xmm1, 16(%0)\n\t" "movdqa %%xmm2, 32(%0)\n\t" "movdqa %%xmm3, 48(%0)\n\t"
+        "movdqa %%xmm4, 64(%0)\n\t" "movdqa %%xmm5, 80(%0)\n\t" "movdqa %%xmm6, 96(%0)\n\t" "movdqa %%xmm7, 112(%0)\n\t"
+        "movdqa %%xmm8, 128(%0)\n\t" "movdqa %%xmm9, 144(%0)\n\t"
+        : : "r"(save) : "memory");
+}
+
+static inline void nvIopSSEEnd(const uint8_t *save)
+{
+    __asm__ __volatile__(
+        "movdqa 0(%0), %%xmm0\n\t" "movdqa 16(%0), %%xmm1\n\t" "movdqa 32(%0), %%xmm2\n\t" "movdqa 48(%0), %%xmm3\n\t"
+        "movdqa 64(%0), %%xmm4\n\t" "movdqa 80(%0), %%xmm5\n\t" "movdqa 96(%0), %%xmm6\n\t" "movdqa 112(%0), %%xmm7\n\t"
+        "movdqa 128(%0), %%xmm8\n\t" "movdqa 144(%0), %%xmm9\n\t"
+        : : "r"(save) : "memory");
+}
+
 static void nvIopRowSSE(const void *src, void *dst, unsigned long bytes, bool l10r)
 {
     static const uint32_t kMask[16] __attribute__((aligned(16))) = {
         0x00ff0000u, 0x00ff0000u, 0x00ff0000u, 0x00ff0000u, 0x0000ff00u, 0x0000ff00u, 0x0000ff00u, 0x0000ff00u,
         0x000000ffu, 0x000000ffu, 0x000000ffu, 0x000000ffu, 0xff000000u, 0xff000000u, 0xff000000u, 0xff000000u,
     };
-    uint8_t save[160] __attribute__((aligned(16)));
-    __asm__ __volatile__(
-        "movdqa %%xmm0, 0(%0)\n\t" "movdqa %%xmm1, 16(%0)\n\t" "movdqa %%xmm2, 32(%0)\n\t" "movdqa %%xmm3, 48(%0)\n\t"
-        "movdqa %%xmm4, 64(%0)\n\t" "movdqa %%xmm5, 80(%0)\n\t" "movdqa %%xmm6, 96(%0)\n\t" "movdqa %%xmm7, 112(%0)\n\t"
-        "movdqa %%xmm8, 128(%0)\n\t" "movdqa %%xmm9, 144(%0)\n\t"
-        : : "r"(save) : "memory");
     if (l10r) {
 #define NV_L10R_LANE(r) \
         "movdqa %%" r ", %%xmm8\n\t" "movdqa %%" r ", %%xmm9\n\t" \
@@ -1078,11 +1090,6 @@ static void nvIopRowSSE(const void *src, void *dst, unsigned long bytes, bool l1
             :
             : "memory", "cc");
     }
-    __asm__ __volatile__(
-        "movdqa 0(%0), %%xmm0\n\t" "movdqa 16(%0), %%xmm1\n\t" "movdqa 32(%0), %%xmm2\n\t" "movdqa 48(%0), %%xmm3\n\t"
-        "movdqa 64(%0), %%xmm4\n\t" "movdqa 80(%0), %%xmm5\n\t" "movdqa 96(%0), %%xmm6\n\t" "movdqa 112(%0), %%xmm7\n\t"
-        "movdqa 128(%0), %%xmm8\n\t" "movdqa 144(%0), %%xmm9\n\t"
-        : : "r"(save) : "memory");
 }
 // A copied frame completes on the VBL tick after it was copied, as a flip latches at the next vblank. Completed at once,
 // WindowServer presented twice within one refresh whenever an app's update came between its own ticks, then skipped the
@@ -1208,6 +1215,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     // DRAM under it, in stripes (2026-10-20). Through the BAR (uncached) they behave as plain stores.
     const bool wide = ((((uintptr_t)src | (uintptr_t)d) & 7) == 0) && !(spr & 1) && !(dpr & 1);
     const bool sse = gIopSse && ((((uintptr_t)src | (uintptr_t)d) & 15) == 0) && !(spr & 3) && !(dpr & 3);
+    uint8_t xmmSave[160] __attribute__((aligned(16)));
+    if (sse) nvIopSSEBegin(xmmSave);
     for (unsigned y = 0; y < h; y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
@@ -1238,6 +1247,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
             __asm__ __volatile__("movnti %1, %0" : "=m"(dw[x]) : "r"(px));
         }
     }
+    if (sse) nvIopSSEEnd(xmmSave);
     __asm__ __volatile__("sfence" ::: "memory");   // the frame is in DRAM before the transaction completes
     fIopVblSeq = __atomic_load_n(&gPhxVblSeq, __ATOMIC_ACQUIRE);
     {
