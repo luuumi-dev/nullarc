@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#import "nvmtl_surface_key.h"
+
 @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
 @implementation NVMTLQueueReservation @end
 @interface NVMTLSubmissionPart : NSObject {
@@ -43,13 +45,17 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
 static NSMapTable *nvmtl_surface_writers;
-static NSString *nvmtl_surface_writer_key(NVMTLTexture *t) {
-    return [NSString stringWithFormat:@"%u:%lu", (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)t->_plane];
+// Compact keys avoid formatting on every surface read/bind and write registration.
+// Keep the full-width legacy key for unusual plane values: truncating to eight
+// bits would alias plane 256 with plane 0. NSNumber and NSString key spaces are
+// disjoint; for planes 0..255, a 32-bit surface ID and eight-bit plane fit in 40 bits.
+static id nvmtl_surface_writer_key(NVMTLTexture *t) {
+    return nvmtl_surface_key(IOSurfaceGetID(t->_surf), t->_plane);
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t || !t->_surf) return NO;
     @synchronized ([NVMTLCommandBuffer class]) {
-        NSString *key = nvmtl_surface_writer_key(t);
+        id key = nvmtl_surface_writer_key(t);
         for (id queue in nvmtl_surface_writers.keyEnumerator) {
             NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
             NVMTLPendingSurfaceWrite *write = writes[key];
@@ -260,7 +266,7 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
     @synchronized ([NVMTLCommandBuffer class]) {
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
-        for (NSString *key in [writes.allKeys copy]) {
+        for (id key in [writes.allKeys copy]) {
             NVMTLPendingSurfaceWrite *write = writes[key];
             if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
         }

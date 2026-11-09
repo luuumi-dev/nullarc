@@ -36,3 +36,11 @@ jobs:
           echo "::error title=Unit tests failed::${msg}"
         fi
         exit "$status"
+
+  surface-key-test:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Test production surface registry and monitors (ASan/UBSan)
+      run: make test-nmplugin-surface-key
