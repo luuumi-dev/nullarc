@@ -320,7 +320,7 @@ bool PhxBringup::start(IOService *provider) {
         }
     }
     PMinit();
-    provider->joinPMtree(this);
+    this->joinPMtree(provider);
     static IOPMPowerState pmStates[2] = {
         { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 1, IOPMDeviceUsable, IOPMPowerOn, IOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }
@@ -1355,6 +1355,14 @@ bool IOAccelPhxNativeClient::start(IOService *provider) {
 }
 
 void IOAccelPhxNativeClient::freeAll() {
+    if (maps && vmid && owner) {
+        for (int i = 0; i < kMaxMaps; i++) {
+            if (maps[i].used) {
+                owner->vmUnmap(vmid, maps[i].va, maps[i].size);
+                maps[i].used = false;
+            }
+        }
+    }
     if (!bos)
         return;
     for (uint32_t h = 1; h < PHXN_MAX_BOS; h++)
@@ -1620,8 +1628,11 @@ IOReturn IOAccelPhxNativeClient::doBoFree(IOExternalMethodArguments *a) {
     if (!b)
         return kIOReturnNotFound;
     for (int i = 0; i < kMaxMaps; i++)
-        if (maps[i].used && maps[i].handle == h)
+        if (maps[i].used && maps[i].handle == h) {
+            if (vmid && owner)
+                owner->vmUnmap(vmid, maps[i].va, maps[i].size);
             maps[i].used = false;
+        }
     if (b->host)
         hostUsed -= b->size;
     else if (b->domain == 2)
@@ -2123,7 +2134,11 @@ IOReturn IOAccelPhxNativeClient::doSurfGpuMark(IOExternalMethodArguments *a) {
         return kIOReturnBadArgument;
     static IOService *accel;
     static const OSSymbol *fn;
-    if (!accel) {
+    if (!accel || accel->isInactive()) {
+        if (accel) {
+            accel->release();
+            accel = nullptr;
+        }
         IOService *s = IOService::copyMatchingService(IOService::serviceMatching("NMXAccel"));
         if (s && !OSCompareAndSwapPtr(nullptr, s, (void *volatile *)&accel))
             s->release();

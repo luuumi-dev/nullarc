@@ -220,7 +220,7 @@ class PhxAMDFB : public IOFramebuffer {
 
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         PhxAMDFB *me = (PhxAMDFB *)p0;
-        if (me->fStopping) return;
+        if (me->fStopping || me->fBlDark) return;
         const uint64_t at = mach_absolute_time(), due = me->fVblNext;
         uint64_t near; nanoseconds_to_absolutetime(50000, &near);
         if (gVblStaged && due > at + near) { thread_call_enter_delayed(me->fVblTimer, due); return; }   // an early stage
@@ -325,7 +325,13 @@ public:
             backlightWrite(0);
         } else {
             fBlDark = false;
+            fVblNext = 0;
             backlightWrite(fBlSaved ? fBlSaved : kBlMax);
+            if (fVblTimer) {
+                uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
+                fVblNext = d;
+                thread_call_enter_delayed(fVblTimer, d);
+            }
         }
         if (fBacklight) fBacklight->setProperty("PhxDark", fBlDark);
         PFBLOG("backlight: display power %s, level %u", on ? "on" : "off", fBlSaved);
@@ -728,6 +734,7 @@ bool PhxAMDFB::start(IOService *provider)
         { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
+    PMinit();
     registerPowerDriver(this, states, 2);
     phxHoldInit(this, kBootHoldSec);
     phxAgdcInstall();
@@ -750,5 +757,6 @@ void PhxAMDFB::stop(IOService *provider)
     OSSafeReleaseNULL(fSurfMap);
     OSSafeReleaseNULL(fVa);
     poolFree();
+    PMstop();
     IOFramebuffer::stop(provider);
 }
