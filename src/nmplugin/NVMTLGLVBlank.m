@@ -107,11 +107,41 @@ static uint64_t nvglvbl_window_period(uint32_t window)
 static void nvglvbl_synchronize(id self, SEL cmd)
 {
     char *surface = (char *)(__bridge void *)self;
+    const uint32_t win = *(uint32_t *)(surface + gGLVBL.window_ivar);
+    uint64_t period = nvglvbl_window_period(win);
+    if (!period) period = nvglvbl_mach_from_seconds(1.0 / 60.0);
+
+    // Rate-limit unthrottled OpenGL render loops so games don't spin at hundreds of FPS burning CPU & power
+    static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+    static struct { uint32_t window; uint64_t last_time; } pace_cache[NVGLVBL_WINDOW_CACHE];
+    if (period > 0) {
+        uint64_t now = mach_absolute_time();
+        os_unfair_lock_lock(&pace_lock);
+        int pslot = -1;
+        for (int i = 0; i < NVGLVBL_WINDOW_CACHE; i++) {
+            if (pace_cache[i].window == win) { pslot = i; break; }
+        }
+        if (pslot < 0) {
+            static unsigned pnext = 0;
+            pslot = (int)(pnext++ % NVGLVBL_WINDOW_CACHE);
+            pace_cache[pslot].window = win;
+            pace_cache[pslot].last_time = 0;
+        }
+        uint64_t target = pace_cache[pslot].last_time + period;
+        if (pace_cache[pslot].last_time && now < target) {
+            os_unfair_lock_unlock(&pace_lock);
+            mach_wait_until(target);
+            now = mach_absolute_time();
+            os_unfair_lock_lock(&pace_lock);
+        }
+        pace_cache[pslot].last_time = now;
+        os_unfair_lock_unlock(&pace_lock);
+    }
+
     NVGLVBLQueueRef queue = *(NVGLVBLQueueRef *)(surface + gGLVBL.queue_ivar);
     if (!queue || !gGLVBL.unconsumed(queue, 0, 0)) return;   // the window server has the previous frame: no wait
     struct nvglvbl_info info[NVGLVBL_ENTRIES];
     const uint32_t n = gGLVBL.vbl_info(queue, info, NVGLVBL_ENTRIES);
-    const uint64_t period = nvglvbl_window_period(*(uint32_t *)(surface + gGLVBL.window_ivar));
     // the entries are the window server's vblank plus 1..n times the spacing CoreAnimation took for the period: with a
     // longer spacing than the display's period, the next vblank is that vblank plus a whole number of periods
     if (n >= 2 && n <= NVGLVBL_ENTRIES && period && info[1].host_time > info[0].host_time &&
