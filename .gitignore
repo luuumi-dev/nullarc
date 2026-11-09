@@ -1,6 +1,7 @@
 # Build outputs and compilation artifacts
 build/
 dist/
+release/
 *.o
 *.dylib
 *.bin
