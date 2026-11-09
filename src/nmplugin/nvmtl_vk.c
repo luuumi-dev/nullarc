@@ -2080,7 +2080,20 @@ static int nvmtl_spirv_bands_ok(const void *p, size_t n, const char *what)
     free(heap);
     return ok;
 }
+/* Backported from NullMoth 18ba05f38b5eadea8b5ae05834bb51c61fb4c5c3.
+ * Keep the baseline binding rules and legacy masks for NVMTL_DESC_MASK=0. */
+static int nvmtl_desc_mask_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_DESC_MASK"); on = !(e && e[0] == '0');
+        nvlog("descriptor masks without the framebuffer-fetch set %s (NVMTL_DESC_MASK=%s)", on ? "on" : "off", e ? e : "unset"); }
+    return on;
+}
+static int nvmtl_spirv_bmask_x(const void *p, size_t n, uint64_t out[4], int skip_fetch);
 static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
+{ return nvmtl_spirv_bmask_x(p, n, out, 0); }
+/* Set 3 framebuffer-fetch descriptors, like the set 2 heap, are bound separately. */
+static int nvmtl_spirv_bmask_x(const void *p, size_t n, uint64_t out[4], int skip_fetch)
 {
     const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
     memset(out, 0, 4 * sizeof *out);
@@ -2093,7 +2106,7 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (!wc || i + wc > nw) { free(heap); return 0; }
-        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
+        if (op == 71 && wc == 4 && w[i + 2] == 34 && (w[i + 3] == 2 || (skip_fetch && w[i + 3] == 3)) && w[i + 1] < bound) heap[w[i + 1]] = 1;
         i += wc;
     }
     int ok = 1;
@@ -2992,7 +3005,9 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3)) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
-    const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
+    const int m2 = nvmtl_desc_mask_on();
+    const uint64_t *pm = (m2 && p->bmask2_ok) ? p->bmask2 : (m2 && p->gmask2_ok && which < 2) ? p->gmask2[which]
+                       : p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
     uint32_t hi = p->stex_hi[which];
     // A texture binding holds an image or, for a shader that reads a texel buffer there, a texel buffer (the layout's
     // descriptors are mutable). The last set can be bound again, or copied from, only by a pipeline that reads the same
@@ -4146,6 +4161,7 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
 
     if (!nvmtl_spirv_ok(vs, vn, "vertex module") || !nvmtl_spirv_ok(fs, fn, "fragment module")) return -1;
     if (!td) out->gmask_ok = (uint32_t)(nvmtl_spirv_bmask(vs, vn, out->gmask[0]) && nvmtl_spirv_bmask(fs, fn, out->gmask[1]));
+    if (!td) out->gmask2_ok = (uint32_t)(nvmtl_spirv_bmask_x(vs, vn, out->gmask2[0], 1) && nvmtl_spirv_bmask_x(fs, fn, out->gmask2[1], 1));
     VkShaderModuleCreateInfo vsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vn, (const uint32_t *)vs };
     uint32_t *fcopy = (uint32_t *)malloc(fn);
     if (!fcopy) { nvlog("vk: out of memory copying the fragment module"); return -1; }
@@ -4353,6 +4369,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     out->tbany = (out->tbm[0][0] | out->tbm[0][1] | out->tbm[0][2] | out->tbm[0][3]) != 0;
     out->lin = nvmtl_spirv_has_specid(cs, n / 4, 3);
     out->bmask_ok = (uint32_t)nvmtl_spirv_bmask(cs, n, out->bmask);
+    out->bmask2_ok = (uint32_t)nvmtl_spirv_bmask_x(cs, n, out->bmask2, 1);
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, n, (const uint32_t *)cs };
     VkShaderModule mod = VK_NULL_HANDLE;
     VKCK(pvkCreateShaderModule(g_dev, &smi, NULL, &mod), "vkCreateShaderModule(compute)");

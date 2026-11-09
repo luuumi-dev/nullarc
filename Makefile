@@ -54,3 +54,7 @@ kext:
 
 clean:
 	rm -rf build/
+
+.PHONY: test-nmplugin-descriptor-mask
+test-nmplugin-descriptor-mask:
+	python3 tests/test_nmplugin_descriptor_mask.py

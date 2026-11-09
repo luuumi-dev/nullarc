@@ -36,3 +36,13 @@ jobs:
           echo "::error title=Unit tests failed::${msg}"
         fi
         exit "$status"
+
+  descriptor-mask-test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Install CPU-test dependencies
+      run: sudo apt-get update && sudo apt-get install -y clang make python3 libvulkan-dev
+    - name: Test production descriptor masks and writer (ASan/UBSan)
+      run: make test-nmplugin-descriptor-mask
