@@ -35,6 +35,7 @@ static_assert(sizeof(PhxAGDCVendorInfo) == 0x2c, "AGDCVendorInfo_t is 0x2c");
 static_assert(sizeof(PhxAGDCGPUCapability) == 0xdc, "AGDCGPUCapability_t is 0xdc");
 
 static IOService *gPci = nullptr, *gFB = nullptr;   // held while the service is up
+extern IOService *gPhxHDMI;
 static SInt64 gCmds = 0, gRefused = 0, gFbReplies = 0, gK5 = 0;
 static int gLastRefused = 0, gLogged = 0;
 
@@ -88,10 +89,12 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
         if (!out || !outSize || *outSize != sizeof(PhxAGDCGPUCapability)) return kIOReturnBadArgument;
         PhxAGDCGPUCapability *c = (PhxAGDCGPUCapability *)out;
         bzero(c, sizeof *c);
-        c->portMask = 1ull << 1;
-        c->countA = c->countB = c->countC = c->countD = 1;
-        c->maxFramebuffers = 1; c->pciDevice = gPci; c->framebuffer[0] = gFB;
-        if (OSAddAtomic64(1, &gFbReplies) < 4) AGLOG("0x980: one framebuffer (PhxFB id %#llx)", gFB ? gFB->getRegistryEntryID() : 0ull);
+        c->portMask = (1ull << 1) | (1ull << 2);
+        c->countA = c->countB = c->countC = c->countD = 2;
+        c->maxFramebuffers = gPhxHDMI ? 2 : 1; c->pciDevice = gPci;
+        c->framebuffer[0] = gFB;
+        c->framebuffer[1] = gPhxHDMI ? gPhxHDMI : gFB;
+        if (OSAddAtomic64(1, &gFbReplies) < 4) AGLOG("0x980: %u framebuffers (PhxFB id %#llx, HDMI id %#llx), 2 ports", c->maxFramebuffers, gFB ? gFB->getRegistryEntryID() : 0ull, gPhxHDMI ? gPhxHDMI->getRegistryEntryID() : 0ull);
         return kIOReturnSuccess;
     }
     // IOPresentment asks for the panel's link (0x921) and plane capabilities (0x711) before it presents through the
@@ -99,15 +102,28 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
     // in software. The firmware lit the panel without telling its timing, so the answer carries the CVT reduced-blanking
     // timing of the mode (NullMoth's K5 replies, nvrm-agdc-k5.h).
     if (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX) {
-        uint32_t t[NVK5_TIMING_WORDS];
-        panelTiming(t);
-        int why = 0;
-        const int r = nvk5_answer(cmd, in, inSize, out, outSize ? *outSize : 0, t, sizeof t, &why);
+        uint32_t t0[NVK5_TIMING_WORDS], t1[NVK5_TIMING_WORDS];
+        panelTiming(t0);
+        // t1 for external 1080p60
+        bzero(t1, sizeof(t1));
+        t1[NVK5_T_TAG] = NVK5_TIMING_TAG;
+        t1[NVK5_T_HVIS] = 1920; t1[NVK5_T_HSS] = 1920 + 88; t1[NVK5_T_HSE] = 1920 + 88 + 44; t1[NVK5_T_HTOT] = 2200;
+        t1[NVK5_T_VVIS] = 1080; t1[NVK5_T_VSS] = 1080 + 4;  t1[NVK5_T_VSE] = 1080 + 4 + 5;   t1[NVK5_T_VTOT] = 1125;
+        t1[NVK5_T_PCLK] = 148500000; // 148.5 MHz standard 1080p60
+        t1[NVK5_T_REFRESH_MHZ] = 60000;
+        t1[NVK5_T_HSYNCPOS] = 1; t1[NVK5_T_VSYNCPOS] = 1;
+
+        struct nvk5_head heads[2] = {
+            { t0, sizeof(t0) },
+            { t1, sizeof(t1) }
+        };
+        int why = 0; int32_t idxOut = -1;
+        const int r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, heads, 2, &why, &idxOut);
         if (r == NVK5_R_LINK || r == NVK5_R_CAPS) {
-            if (OSAddAtomic64(1, &gK5) < 8) AGLOG("command %#x answered (%s)", cmd, r == NVK5_R_LINK ? "link config" : "plane scaler");
+            if (OSAddAtomic64(1, &gK5) < 8) AGLOG("command %#x answered (%s head %d)", cmd, r == NVK5_R_LINK ? "link config" : "plane scaler", idxOut);
             return kIOReturnSuccess;
         }
-        if (gLogged < 40) { gLogged++; AGLOG("command %#x not answered (result %d, why %#x)", cmd, r, why); }
+        if (gLogged < 40) { gLogged++; AGLOG("command %#x not answered (result %d, why %#x, head %d)", cmd, r, why, idxOut); }
         if (r == NVK5_R_BADARG) return kIOReturnBadArgument;
         if (r == NVK5_R_NOTFOUND) return kIOReturnNotFound;
     }
