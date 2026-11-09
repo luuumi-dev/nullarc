@@ -36,3 +36,12 @@ jobs:
           echo "::error title=Unit tests failed::${msg}"
         fi
         exit "$status"
+
+  sampler-key-macos:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Test sampler keys with ASan and UBSan
+      run: make test-nmplugin-sampler-key

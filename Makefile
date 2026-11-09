@@ -12,7 +12,7 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_phx_topology \
         $(TEST_BIN_DIR)/test_wait_seq
 
-.PHONY: all test clean kext fixtures
+.PHONY: all test test-nmplugin-sampler-key clean kext fixtures
 
 all: test
 
@@ -44,6 +44,15 @@ test: $(TESTS)
 		$$t || exit 1; \
 	done
 	@echo "All unit tests passed successfully!"
+
+# Foundation-based regression test; run on macOS independently of the Linux suite.
+$(TEST_BIN_DIR)/test_nmplugin_sampler_key: tests/test_nmplugin_sampler_key.m src/nmplugin/nvmtl_sampler_key.h Makefile | $(TEST_BIN_DIR)
+	xcrun clang -O1 -g -Wall -Wextra -Werror -fobjc-arc -fblocks \
+		-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+		tests/test_nmplugin_sampler_key.m -framework Foundation -o $@
+
+test-nmplugin-sampler-key: $(TEST_BIN_DIR)/test_nmplugin_sampler_key
+	./$(TEST_BIN_DIR)/test_nmplugin_sampler_key
 
 fixtures:
 	bash tools/fetch_test_firmware.sh tests/fixtures/phoenix
