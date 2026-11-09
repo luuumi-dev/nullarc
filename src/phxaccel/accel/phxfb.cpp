@@ -356,7 +356,7 @@ public:
         if (mode != 1 || !info) return kIOReturnBadArgument;
         bzero(info, sizeof(*info));
         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
-        info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag | kFramebufferSupportsGammaCorrection;
         return kIOReturnSuccess;
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
@@ -399,22 +399,6 @@ public:
         return kIOReturnSuccess;
     }
     IOReturn setInterruptState(void *, UInt32) override { return kIOReturnSuccess; }
-    IOReturn getGammaTableCapabilities(UInt32 *channelCount, UInt32 *entryCount, UInt32 *dataWidth) override {
-        if (channelCount) *channelCount = 3;
-        if (entryCount) *entryCount = 256;
-        if (dataWidth) *dataWidth = 8;
-        return kIOReturnSuccess;
-    }
-    IOReturn getGammaTable(UInt32 channelCount, UInt32 entryCount, UInt32 dataWidth, void *data) override {
-        if (!data || channelCount != 3 || entryCount != 256) return kIOReturnBadArgument;
-        uint8_t *p = (uint8_t *)data;
-        for (UInt32 c = 0; c < channelCount; c++) {
-            for (UInt32 i = 0; i < entryCount; i++) {
-                p[c * entryCount + i] = (uint8_t)i;
-            }
-        }
-        return kIOReturnSuccess;
-    }
     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *) override { return kIOReturnSuccess; }
     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *, bool) override { return kIOReturnSuccess; }
     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
@@ -708,6 +692,11 @@ bool PhxAMDFB::start(IOService *provider)
     fVa = IORangeAllocator::withRange(kVaSize - 1, PAGE_SIZE, 0, IORangeAllocator::kLocking);
     poolInit();
     setProperty("built-in", kOSBooleanTrue);
+    setProperty("IOFBGammaWidth", 8ull, 32);
+    setProperty("IOFBGammaCount", 256ull, 32);
+    setProperty("DisplayGammaChannels", 3ull, 32);
+    setProperty("DisplayGammaEntryCount", 256ull, 32);
+    setProperty("DisplayGammaEntrySize", 1ull, 32);
     setProperty("PhxFBWidth", fWidth, 32); setProperty("PhxFBHeight", fHeight, 32);   // the AGDC's panel timing reads these
     measureRefresh();
     setProperty("PhxFBRefreshMilliHz", fRefreshMilliHz, 32);
