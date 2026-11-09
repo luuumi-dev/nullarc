@@ -115,6 +115,8 @@ public:
     IOReturn vmUnmap(uint32_t vmid, uint64_t va, uint64_t size);
     IOReturn gpuSubmit(uint32_t vmid, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seq);
     uint64_t gpuRetired() const;
+    const phx_topology *capturedTopology() const { return topology; }
+    IOReturn setPowerState(unsigned long ordinal, IOService *whichDevice) override;
 
 private:
     uint32_t rreg(uint32_t reg) const;
@@ -126,6 +128,8 @@ private:
     void readFbLayout();
     void clearRing();
 
+    const phx_topology *topology{nullptr};
+    bool isSleeping{false};
     IOPCIDevice *pci{nullptr};
     IOMemoryMap *mmio{nullptr};
     IOLock *smuLock{nullptr};
@@ -239,6 +243,7 @@ private:
 
     IOReturn doHello(IOExternalMethodArguments *a);
     IOReturn doQueryInfo(IOExternalMethodArguments *a);
+    IOReturn doTopology(IOExternalMethodArguments *a);
     IOReturn doReadRegs(IOExternalMethodArguments *a);
     IOReturn doBoCreate(IOExternalMethodArguments *a);
     IOReturn doBoFree(IOExternalMethodArguments *a);
@@ -300,6 +305,27 @@ bool PhxBringup::start(IOService *provider) {
     if (!pci)
         return false;
     pci->retain();
+    {
+        uint16_t v = pci->configRead16(0);
+        uint16_t d = pci->configRead16(2);
+        uint8_t rev = pci->configRead8(8);
+        uint16_t sv = pci->configRead16(0x2c);
+        uint16_t sd = pci->configRead16(0x2e);
+        topology = phx_find_topology(v, d, rev, sv, sd);
+        if (topology) {
+            setProperty("phx-topology-cu", topology->cu_active_number, 32);
+            setProperty("phx-topology-rb", topology->num_rb_pipes, 32);
+            IOLog("PhxBringup: topology matched: %u active CUs, %u RBs for device 0x%04x:0x%04x\n",
+                  topology->cu_active_number, topology->num_rb_pipes, v, d);
+        }
+    }
+    PMinit();
+    provider->joinPMtree(this);
+    static IOPMPowerState pmStates[2] = {
+        { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 1, IOPMDeviceUsable, IOPMPowerOn, IOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }
+    };
+    registerPowerDriver(this, pmStates, 2);
     {   // the GPU must be a bus master before it can DMA to/from system memory (page tables, user BOs)
         uint16_t cmd = pci->configRead16(kIOPCIConfigCommand);
         setProperty("phx-pci-cmd-before", cmd, 16);
@@ -396,7 +422,19 @@ void PhxBringup::stop(IOService *provider) {
         IOLockFree(smuLock);
         smuLock = nullptr;
     }
+    PMstop();
     IOService::stop(provider);
+}
+
+IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice) {
+    if (ordinal == 0) {
+        IOLog("PhxBringup: powerStateWillChange to sleep (state 0)\n");
+        isSleeping = true;
+    } else {
+        IOLog("PhxBringup: powerStateDidChange from sleep (state 1)\n");
+        isSleeping = false;
+    }
+    return IOPMAckImplied;
 }
 
 uint32_t PhxBringup::rreg(uint32_t reg) const {
@@ -419,8 +457,19 @@ void PhxBringup::readFbLayout() {
     setProperty("phx-fb-phys", fbPhys, 64);
     // About This Mac / System Information name the GPU from the PCI device's "model" and size its memory from
     // "VRAM,totalMB"; without them the 780M read "Display, 15 MB" (the boot framebuffer)
-    static const char kModel[] = "AMD Radeon 780M";
-    if (OSData *m = OSData::withBytes(kModel, sizeof(kModel))) {
+    static const char kModel780[] = "AMD Radeon 780M";
+    static const char kModel760[] = "AMD Radeon 760M";
+    static const char kModel740[] = "AMD Radeon 740M";
+    const char *model = kModel780;
+    unsigned modelSize = sizeof(kModel780);
+    if (topology) {
+        if (topology->cu_active_number <= 4) {
+            model = kModel740; modelSize = sizeof(kModel740);
+        } else if (topology->cu_active_number <= 8) {
+            model = kModel760; modelSize = sizeof(kModel760);
+        }
+    }
+    if (OSData *m = OSData::withBytes(model, modelSize)) {
         pci->setProperty("model", m);
         m->release();
     }
@@ -1378,6 +1427,8 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
                                                 IOExternalMethodDispatch *, OSObject *, void *) {
     if (selector == PHXN_SEL_WAITSEQ)
         return doWaitSeq(a);
+    if (selector == PHXN_SEL_TOPOLOGY)
+        return doTopology(a);
     if (selector == PHXN_SEL_SURF_GPU_MARK)   // no client state: a ready mark must not wait behind a submission
         return doSurfGpuMark(a);
 
@@ -1462,6 +1513,16 @@ IOReturn IOAccelPhxNativeClient::doQueryInfo(IOExternalMethodArguments *a) {
     inf.max_bos = PHXN_MAX_BOS;
     inf.fence_slots = PHXN_FENCE_SLOTS;
     bcopy(&inf, a->structureOutput, sizeof(inf));
+    return kIOReturnSuccess;
+}
+
+IOReturn IOAccelPhxNativeClient::doTopology(IOExternalMethodArguments *a) {
+    if (!shape(a, 0, 0, 0, sizeof(phx_topology)))
+        return kIOReturnBadArgument;
+    const phx_topology *p = owner->capturedTopology();
+    if (!p)
+        return kIOReturnUnsupported;
+    bcopy(p, a->structureOutput, sizeof(*p));
     return kIOReturnSuccess;
 }
 
@@ -2105,8 +2166,16 @@ IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {
         if (timeout > PHXN_WAIT_CAP_NS)
             timeout = PHXN_WAIT_CAP_NS;
         uint64_t retired = owner->gpuRetired();
-        for (uint64_t waited = 0; retired < target && waited < timeout; waited += 100000) {
-            IODelay(100);
+        for (uint64_t waited = 0; retired < target && waited < timeout; ) {
+            if (waited < 1000000ull) {
+                // Short wait (< 1 ms): fast poll with 50 us delay for low latency
+                IODelay(50);
+                waited += 50000ull;
+            } else {
+                // Extended wait (>= 1 ms): yield CPU to scheduler to avoid starving WindowServer & system threads
+                IOSleep(1);
+                waited += 1000000ull;
+            }
             retired = owner->gpuRetired();
         }
         if (retired >= target) {

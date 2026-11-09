@@ -32,7 +32,7 @@
 			<!-- the 780M panel over the firmware (GOP) mode, at boot in place of the firmware framebuffer (IONDRV): above its
 			     score in the same category, like NullMoth's NMIntelFB. start() declines unless NVRAM phxfb-boot is set (one
 			     boot per arming), and then IONDRV still takes the device -->
-			<key>IOPCIPrimaryMatch</key><string>0x19001002</string>
+			<key>IOPCIMatch</key><string>0x19001002 0x15bf1002 0x15c81002 0x164e1002</string>
 			<key>IOProbeScore</key><integer>60000</integer>
 			<key>IOMatchCategory</key><string>IOFramebuffer</string>
 		</dict>
@@ -41,8 +41,8 @@
 			<key>CFBundleIdentifier</key><string>com.luuumi.PhxAccel</string>
 			<key>IOClass</key><string>NMXAccel</string>
 			<key>IOProviderClass</key><string>IOPCIDevice</string>
-			<!-- Radeon 780M (Phoenix / Hawk Point, 1002:1900). Starts only after PhxBringup sets nmxgpu-claimed. -->
-			<key>IOPCIPrimaryMatch</key><string>0x19001002</string>
+			<!-- Radeon 780M / 760M / 740M (Phoenix / Hawk Point). Starts only after PhxBringup sets nmxgpu-claimed. -->
+			<key>IOPCIMatch</key><string>0x19001002 0x15bf1002 0x15c81002 0x164e1002</string>
 			<!-- never at boot: PhxBringup sets this on the PCI device (selector 113) once the GPU runs, then re-runs matching -->
 			<key>IOPropertyMatch</key><dict><key>nmxgpu-claimed</key><true/></dict>
 			<key>IOMatchCategory</key><string>IOAccelerator</string>

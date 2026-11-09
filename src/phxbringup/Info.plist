@@ -29,7 +29,7 @@
 			<key>IOMatchCategory</key>
 			<string>PhxBringup</string>
 			<key>IOPCIMatch</key>
-			<string>0x19001002</string>
+			<string>0x19001002 0x15bf1002 0x15c81002 0x164e1002</string>
 			<key>IOProbeScore</key>
 			<integer>0</integer>
 			<key>IOProviderClass</key>

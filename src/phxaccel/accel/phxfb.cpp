@@ -399,6 +399,22 @@ public:
         return kIOReturnSuccess;
     }
     IOReturn setInterruptState(void *, UInt32) override { return kIOReturnSuccess; }
+    IOReturn getGammaTableCapabilities(UInt32 *channelCount, UInt32 *entryCount, UInt32 *dataWidth) override {
+        if (channelCount) *channelCount = 3;
+        if (entryCount) *entryCount = 256;
+        if (dataWidth) *dataWidth = 8;
+        return kIOReturnSuccess;
+    }
+    IOReturn getGammaTable(UInt32 channelCount, UInt32 entryCount, UInt32 dataWidth, void *data) override {
+        if (!data || channelCount != 3 || entryCount != 256) return kIOReturnBadArgument;
+        uint8_t *p = (uint8_t *)data;
+        for (UInt32 c = 0; c < channelCount; c++) {
+            for (UInt32 i = 0; i < entryCount; i++) {
+                p[c * entryCount + i] = (uint8_t)i;
+            }
+        }
+        return kIOReturnSuccess;
+    }
     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *) override { return kIOReturnSuccess; }
     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *, bool) override { return kIOReturnSuccess; }
     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
