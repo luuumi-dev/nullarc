@@ -50,8 +50,15 @@ SYSCTL_INT(_debug, OID_AUTO, phxfb_vbl_staged, CTLFLAG_RW | CTLFLAG_LOCKED, &gVb
 SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblN, "VBL ticks fired");
 SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_sum, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsSum, "microseconds the VBL ticks fired past their deadlines, summed");
 SYSCTL_QUAD(_debug, OID_AUTO, phxfb_vbl_late_us_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLateUsMax, "the latest VBL tick, microseconds past its deadline (writable: 0 restarts it)");
+int phxSpawnHdmi(int enable);
+static int phxfb_hdmi_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, phxfb_hdmi, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, phxfb_hdmi_sysctl, "I",
+            "1 = spawn PhxHDMIHead (external 1080p60 HDMI head), 0 = terminate it");
+
 static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysctl__debug_phxfb_vbl_staged, &sysctl__debug_phxfb_vbl_n,
-                                              &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max };
+                                              &sysctl__debug_phxfb_vbl_late_us_sum, &sysctl__debug_phxfb_vbl_late_us_max,
+                                              &sysctl__debug_phxfb_hdmi };
 
 // The panel's backlight is the display block's PWM (DCN 3.1.4 PWRSEQ0, segment 2 base 0x34c0): ACPI's _BCM only asks the
 // GPU driver through ATIF (AFN7), and the firmware leaves the PWM on at full duty (period 4000, 12 bits). It is set as
@@ -74,6 +81,7 @@ static inline uint64_t nextAllocCookie() {
 class PhxAMDFB : public IOFramebuffer {
     OSDeclareDefaultStructors(PhxAMDFB)
     friend class PhxHDMIHead;
+    friend int phxSpawnHdmi(int enable);
 private:
     IOPCIDevice *fPCI = nullptr;
     IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out surface through the BAR
@@ -712,6 +720,8 @@ public:
             PFBLOG("PhxHDMIHead: failed to map scanout buffer at 0x%llx", (unsigned long long)(fBase + 0x01000000ull));
             return false;
         }
+        uint32_t *pix = (uint32_t *)fSurfMap->getVirtualAddress();
+        for (size_t i = 0; i < 1920 * 1080; i++) pix[i] = 0xFF102030;
 
         fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) {
@@ -871,6 +881,104 @@ public:
 };
 OSDefineMetaClassAndStructors(PhxHDMIHead, IOFramebuffer)
 
+static PhxAMDFB *gPhxPrimaryFB = nullptr;
+static PhxHDMIHead *gPhxHDMIHead = nullptr;
+static PhxHDMINub *gPhxHDMINub = nullptr;
+
+int phxSpawnHdmi(int enable) {
+    if (enable) {
+        if (gPhxHDMIHead) return 0;
+        if (!gPhxPrimaryFB || !gPhxPrimaryFB->fPCI) {
+            PFBLOG("phxSpawnHdmi: primary FB or PCI device not ready");
+            return -1;
+        }
+
+        gPhxHDMINub = new PhxHDMINub;
+        if (!gPhxHDMINub) return -1;
+        if (!gPhxHDMINub->init()) {
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+            return -1;
+        }
+        if (!gPhxHDMINub->attach(gPhxPrimaryFB->fPCI)) {
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+            return -1;
+        }
+        gPhxHDMINub->registerService();
+
+        gPhxHDMIHead = new PhxHDMIHead;
+        if (!gPhxHDMIHead) {
+            gPhxHDMINub->detach(gPhxPrimaryFB->fPCI);
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+            return -1;
+        }
+        if (!gPhxHDMIHead->init()) {
+            gPhxHDMIHead->release();
+            gPhxHDMIHead = nullptr;
+            gPhxHDMINub->detach(gPhxPrimaryFB->fPCI);
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+            return -1;
+        }
+
+        gPhxHDMIHead->fPrimary = gPhxPrimaryFB;
+        gPhxHDMIHead->fBase = gPhxPrimaryFB->fBase;
+        gPhxHDMIHead->fMmio = gPhxPrimaryFB->fMmio;
+        if (gPhxHDMIHead->fMmio) gPhxHDMIHead->fMmio->retain();
+
+        if (!gPhxHDMIHead->attach(gPhxHDMINub)) {
+            gPhxHDMIHead->release();
+            gPhxHDMIHead = nullptr;
+            gPhxHDMINub->detach(gPhxPrimaryFB->fPCI);
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+            return -1;
+        }
+
+        gPhxHDMI = gPhxHDMIHead;
+
+        if (!gPhxHDMIHead->start(gPhxHDMINub)) {
+            gPhxHDMI = nullptr;
+            gPhxHDMIHead->detach(gPhxHDMINub);
+            gPhxHDMIHead->release();
+            gPhxHDMIHead = nullptr;
+            gPhxHDMINub->detach(gPhxPrimaryFB->fPCI);
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+            PFBLOG("phxSpawnHdmi: PhxHDMIHead start failed");
+            return -1;
+        }
+
+        PFBLOG("phxSpawnHdmi: PhxHDMIHead published (1920x1080@60Hz)");
+        return 0;
+    } else {
+        if (!gPhxHDMIHead) return 0;
+        PFBLOG("phxSpawnHdmi: stopping PhxHDMIHead");
+        gPhxHDMI = nullptr;
+        gPhxHDMIHead->terminate(kIOServiceRequired | kIOServiceSynchronous);
+        gPhxHDMIHead->release();
+        gPhxHDMIHead = nullptr;
+        if (gPhxHDMINub) {
+            gPhxHDMINub->terminate(kIOServiceRequired | kIOServiceSynchronous);
+            gPhxHDMINub->release();
+            gPhxHDMINub = nullptr;
+        }
+        return 0;
+    }
+}
+
+static int phxfb_hdmi_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = (gPhxHDMI != nullptr) ? 1 : 0;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v != 0 && v != 1) return EINVAL;
+    int r = phxSpawnHdmi(v);
+    return r ? EIO : 0;
+}
+
 // The panel's brightness as a display parameter. IOGraphics looks for parameter handlers under the framebuffer, and
 // takes a built-in TFT panel for a backlit one (AppleBacklightDisplay) only while a service named "backlight" exists.
 class PhxBacklight : public IODisplayParameterHandler {
@@ -974,6 +1082,7 @@ bool PhxAMDFB::start(IOService *provider)
 {
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) return false;
+    gPhxPrimaryFB = this;
 
     char arg[8];
     if (PE_parse_boot_argn("-phxfboff", arg, sizeof arg)) { PFBLOG("-phxfboff: leaving the firmware framebuffer"); return false; }
@@ -1073,6 +1182,7 @@ bool PhxAMDFB::start(IOService *provider)
 void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
+    if (gPhxPrimaryFB == this) gPhxPrimaryFB = nullptr;
     if (gPhxHDMI) {
         gPhxHDMI->terminate();
         gPhxHDMI = nullptr;

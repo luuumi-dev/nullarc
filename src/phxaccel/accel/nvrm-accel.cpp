@@ -52,6 +52,8 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
+boolean_t thread_call_cancel(struct thread_call *call);
+boolean_t thread_call_free(struct thread_call *call);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
 uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
@@ -336,6 +338,17 @@ public:
     // mode change. Boot-arg -nvaccelnoheadless keeps the old behaviour.
     static constexpr uint32_t kHeadlessDeadlineSec = 60;   // chosen: NVRMFB heads publish within ~20 s of start (#76 log)
     struct thread_call *fHeadlessCall = nullptr;
+    struct thread_call *fFanCall = nullptr;
+    static void fanWorker(void *p0, void *p1);
+    void armFanWorker() {
+        fFanCall = thread_call_allocate(&NVAccel::fanWorker, this);
+        if (fFanCall) {
+            uint64_t when = 0;
+            clock_interval_to_deadline(500, kMillisecondScale, &when);
+            thread_call_enter_delayed(fFanCall, when);
+            IOLog("PhxAccel: Firebat acoustic fan regulator armed\n");
+        }
+    }
     void armHeadlessCheck() {
         int off = 0;
         if (PE_parse_boot_argn("-nvaccelnoheadless", &off, sizeof off)) { ALOG("headless check: off (-nvaccelnoheadless)"); return; }
@@ -736,12 +749,21 @@ public:
                     ALOG("MetalPluginName withheld -- nothing will load the Metal plugin until "
                          "`sysctl -w debug.nvaccelfb=1` puts it back, and a reboot takes it away again");
                     armHeadlessCheck();
+                    armFanWorker();
                 }
             } else ALOG("serviceMatching(NVRMFramebuffer) returned NULL -- cannot watch for the framebuffer");
         }
         return r;
     }
-    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
+    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
+        if (fFanCall) {
+            thread_call_cancel(fFanCall);
+            while (!thread_call_free(fFanCall)) { thread_call_cancel(fFanCall); IOSleep(5); }
+            fFanCall = nullptr;
+        }
+        ALOG("stop");
+        IOGraphicsAccelerator2::stop(provider);
+    }
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
@@ -1325,30 +1347,88 @@ SYSCTL_PROC(_debug, OID_AUTO, nvaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCK
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
+static int gFirebatFanMode = 2; // Default to Quiet (2)
+
+void NVAccel::fanWorker(void *p0, void *p1)
+{
+    NVAccel *me = (NVAccel *)p0;
+    if (!me || me != gAccel) return;
+
+    vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
+    if (va) {
+        volatile uint8_t *ec = (volatile uint8_t *)va;
+        ec[0x04] = 0x01; // keep OS handshake alive
+        ec[0x18] = 0x00; // kill 100% full fan blast
+        ec[0x17] = 0x00;
+
+        uint8_t cput = ec[0x70];
+        uint8_t target_fan = 1;
+
+        if (gFirebatFanMode >= 10 && gFirebatFanMode <= 16) {
+            target_fan = (uint8_t)(gFirebatFanMode - 10);
+        } else if (gFirebatFanMode == 1) { // Turbo
+            target_fan = (cput > 85) ? 6 : (cput > 75) ? 5 : (cput > 65) ? 4 : 3;
+        } else if (gFirebatFanMode == 0) { // Balanced
+            target_fan = (cput > 88) ? 6 : (cput > 80) ? 5 : (cput > 70) ? 3 : 2;
+        } else { // Quiet (2) / Office (3)
+            // Zero-RPM silent curve up to 65°C
+            if (cput < 65) target_fan = 0;
+            else if (cput < 75) target_fan = 1;
+            else if (cput < 85) target_fan = 2;
+            else if (cput < 92) target_fan = 3;
+            else if (cput < 96) target_fan = 5;
+            else target_fan = 6; // safety emergency
+        }
+
+        if (ec[0x74] != target_fan) ec[0x74] = target_fan;
+        if (ec[0x76] != target_fan) ec[0x76] = target_fan;
+    }
+
+    if (me->fFanCall) {
+        uint64_t when = 0;
+        clock_interval_to_deadline(1000, kMillisecondScale, &when);
+        thread_call_enter_delayed(me->fFanCall, when);
+    }
+}
+
 static int firebat_fan_mode_sysctl SYSCTL_HANDLER_ARGS
 {
     vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
     if (!va) return EIO;
     volatile uint8_t *ec = (volatile uint8_t *)va;
 
-    int val = (int)ec[0x31]; // read current FCMO
-    IOLog("PhxAccel: Firebat diag: CPUT=%d C, Fan0=%d, Fan1=%d, FCMO=0x%02x, FCMI=0x%02x, FFFG=0x%02x, OSFG=0x%02x\n",
-          ec[0x70], ec[0x74], ec[0x76], ec[0x31], ec[0x32], ec[0x18], ec[0x04]);
+    int val = gFirebatFanMode;
+    IOLog("PhxAccel: Firebat diag: CPUT=%d C, Fan0=%d, Fan1=%d, FCMO=0x%02x, FCMI=0x%02x, FFFG=0x%02x, OSFG=0x%02x, FanMode=%d\n",
+          ec[0x70], ec[0x74], ec[0x76], ec[0x31], ec[0x32], ec[0x18], ec[0x04], gFirebatFanMode);
+
     int err = sysctl_handle_int(oidp, &val, 0, req);
     if (err == 0 && req->newptr != USER_ADDR_NULL) {
-        ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
-        ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan blast)
+        gFirebatFanMode = val;
+        ec[0x04] = 0x01; // OSFG = 1
+        ec[0x18] = 0x00; // FFFG = 0
+        ec[0x17] = 0x00; // FFLG = 0
 
-        uint8_t target = 0x82;
-        if (val == 0) target = 0x80;       // Balanced
-        else if (val == 1) target = 0x81;  // Turbo
-        else if (val == 2) target = 0x82;  // Quiet
-        else if (val == 3) target = 0x83;  // Office
-        else target = (uint8_t)val;
+        if (val >= 10 && val <= 16) {
+            uint8_t target_fan = (uint8_t)(val - 10);
+            ec[0x74] = target_fan;
+            ec[0x76] = target_fan;
+            IOLog("PhxAccel: Firebat manual fan set: Fan0=%d, Fan1=%d\n", ec[0x74], ec[0x76]);
+        } else {
+            uint8_t target = 0x82;
+            if (val == 0) target = 0x80;       // Balanced
+            else if (val == 1) target = 0x81;  // Turbo
+            else if (val == 2) target = 0x82;  // Quiet
+            else if (val == 3) target = 0x83;  // Office
+            else target = (uint8_t)val;
 
-        ec[0x32] = target; // write FCMI
-        IOLog("PhxAccel: Firebat EC fan mode set FCMI=0x%02x, OSFG=1, FFFG=0 (was FCMO=0x%02x, now FCMO=0x%02x)\n",
-              target, (uint8_t)val, ec[0x31]);
+            ec[0x32] = target; // write FCMI
+            if (val == 2 || val == 3) {
+                ec[0x74] = 1;
+                ec[0x76] = 1;
+            }
+            IOLog("PhxAccel: Firebat EC fan mode set FCMI=0x%02x (FCMO=0x%02x, Fan0=%d, Fan1=%d)\n",
+                  target, ec[0x31], ec[0x74], ec[0x76]);
+        }
     }
     return err;
 }
