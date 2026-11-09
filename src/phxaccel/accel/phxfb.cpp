@@ -18,6 +18,7 @@
 #include <IOKit/IORangeAllocator.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <libkern/OSAtomic.h>
+#include <IOKit/IOCommandGate.h>
 #include <sys/sysctl.h>
 #include "nvrm_vram_abi.h"
 #include "nvrm_gpuva_abi.h"
@@ -421,11 +422,47 @@ public:
     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
     IOReturn setApertureEnable(IOPixelAperture, IOOptionBits) override { return kIOReturnSuccess; }
     IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
-    // power and connection answers as NullMoth's NMIntelFB/NVRMFB give them: acknowledge at once, never queue on the
-    // controller thread (a base-class power change waited 45 s for an acknowledge and froze WindowServer restarts)
+    IOCommandGate *fWakeGate = nullptr;
+    bool fSysSlept = false;
+
+    void familyDidWake() {
+        IOWorkLoop *wl = getWorkLoop();
+        if (!fWakeGate && wl) {
+            fWakeGate = IOCommandGate::commandGate(this);
+            if (fWakeGate && wl->addEventSource(fWakeGate) != kIOReturnSuccess) OSSafeReleaseNULL(fWakeGate);
+        }
+        if (!fWakeGate) {
+            PFBLOG("system wake: no command gate on workloop, delivering direct");
+            deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)true);
+            deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)false);
+            deliverFramebufferNotification(kIOFBNotifyDidPowerOn, (void *)false);
+            pagingState = true;
+            return;
+        }
+        fWakeGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &PhxAMDFB::familyDidWakeGated));
+    }
+
+    IOReturn familyDidWakeGated(void *, void *, void *, void *) {
+        deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)true);
+        deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)false);
+        deliverFramebufferNotification(kIOFBNotifyDidPowerOn, (void *)false);
+        pagingState = true;
+        if (fWakeGate) fWakeGate->commandWakeup(&fServerConnect, false);
+        PFBLOG("system wake: clients told DidWake, pagingState on, WindowServer woken");
+        return kIOReturnSuccess;
+    }
+
+    // power and connection answers: acknowledge at once, never queue on the controller thread.
+    // On wake, deliver DidWake, set pagingState, and wake WindowServer sleeping on fServerConnect.
     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
         displayPower(ordinal != 0);
-        handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (ordinal) {
+            if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
+            else handleEvent(kIOFBNotifyDidPowerOn);
+        } else {
+            fSysSlept = true;
+            handleEvent(kIOFBNotifyWillPowerOff);
+        }
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
@@ -433,11 +470,14 @@ public:
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
         if (attribute == kIOPowerAttribute) {
             displayPower(value != 0);
-            if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
-                         return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
+            if (value) {
+                if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
+                else handleEvent(kIOFBNotifyDidPowerOn);
+                return kIOReturnSuccess;
+            }
+            fSysSlept = true;
             handleEvent(kIOFBNotifyWillPowerOff);
-            IOReturn r = IOFramebuffer::setAttribute(attribute, value);
-            return r == kIOReturnUnsupported ? kIOReturnSuccess : r;
+            return kIOReturnSuccess;
         }
         return IOFramebuffer::setAttribute(attribute, value);
     }
@@ -752,6 +792,7 @@ void PhxAMDFB::stop(IOService *provider)
     if (gAliasSysctl) { for (auto *o : kFbOids) sysctl_unregister_oid(o); gAliasSysctl = false; }
     gPhxFrameAbs = 0;
     if (fBacklight) { fBacklight->terminate(); OSSafeReleaseNULL(fBacklight); }
+    if (fWakeGate) { if (IOWorkLoop *wl = getWorkLoop()) wl->removeEventSource(fWakeGate); OSSafeReleaseNULL(fWakeGate); }
     OSSafeReleaseNULL(fMmio);
     OSSafeReleaseNULL(fAliasMap);
     OSSafeReleaseNULL(fSurfMap);
