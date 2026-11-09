@@ -57,6 +57,8 @@ uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 void proc_selfname(char *buf, int size);
 }
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
 static void nvaccelInstallSysctl(void);
@@ -674,6 +676,11 @@ public:
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
+            if (vm_offset_t va = ml_io_map(0xFE0B0400, 0x100)) {
+                volatile uint8_t *ec = (volatile uint8_t *)va;
+                ec[0x32] = 0x82;
+                IOLog("PhxAccel: Firebat EC fan mode set FCMI=0x82 (Quiet), FCMO=0x%02x\n", ec[0x31]);
+            }
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
                 if (!c) break;
@@ -1313,6 +1320,34 @@ static int nvaccelfb_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, nvaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, nvaccelfb_sysctl, "I",
             "register the NVIDIA framebuffer with the accelerator display machine (1 = found_framebuffer, 2 = family sweep)");
+
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+static int firebat_fan_mode_sysctl SYSCTL_HANDLER_ARGS
+{
+    vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
+    if (!va) return EIO;
+    volatile uint8_t *ec = (volatile uint8_t *)va;
+
+    int val = (int)ec[0x31]; // read current FCMO
+    int err = sysctl_handle_int(oidp, &val, 0, req);
+    if (err == 0 && req->newptr != USER_ADDR_NULL) {
+        uint8_t target = 0x82;
+        if (val == 0) target = 0x80;       // Balanced
+        else if (val == 1) target = 0x81;  // Turbo
+        else if (val == 2) target = 0x82;  // Quiet
+        else if (val == 3) target = 0x83;  // Office
+        else target = (uint8_t)val;
+
+        ec[0x32] = target; // write FCMI
+        IOLog("PhxAccel: Firebat EC fan mode set FCMI=0x%02x (was FCMO=0x%02x, now FCMO=0x%02x)\n",
+              target, (uint8_t)val, ec[0x31]);
+    }
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, firebat_fan_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, firebat_fan_mode_sysctl, "I",
+            "Firebat U6C EC fan profile: 0=Balanced(0x80), 1=Turbo(0x81), 2=Quiet(0x82), 3=Office(0x83)");
 #define NVACCEL_CNT(nm, var, desc) SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&var, desc)
 NVACCEL_CNT(nvaccel_vm_alloc,         gCntVmAlloc,        "NVVidMemory::allocPhysical successes");
 NVACCEL_CNT(nvaccel_vm_alloc_bytes,   gCntVmAllocBytes,   "bytes of VRAM granted to NVVidMemory");
