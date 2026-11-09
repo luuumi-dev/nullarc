@@ -55,7 +55,7 @@ static struct sysctl_oid *const kFbOids[] = { &sysctl__debug_phxfb_alias, &sysct
 // GPU driver through ATIF (AFN7), and the firmware leaves the PWM on at full duty (period 4000, 12 bits). It is set as
 // Linux's panel_cntl does without DMUB: lock the group, write the active count, unlock, wait for the pending update.
 // tools/phxctl/phxbl does the same from user space. -phxbloff leaves the panel without a brightness control.
-enum : uint32_t { kBlCntl = 0x34c0 + 0x2f19, kBlPeriod = 0x34c0 + 0x2f1b, kBlLock = 0x34c0 + 0x2f1c };
+enum : uint32_t { kBlPwrSeq = 0x34c0 + 0x2f14, kBlCntl = 0x34c0 + 0x2f19, kBlPeriod = 0x34c0 + 0x2f1b, kBlLock = 0x34c0 + 0x2f1c };
 // The firmware runs both PWM generators, PWRSEQ0 and PWRSEQ1 (+0x6c), at full duty, and PWRSEQ0 alone left the panel's
 // brightness as it was (2026-10-25: eDP DPCD 0x721 says the panel follows its PWM pin): both get the level.
 static constexpr uint32_t kBlSeqs[] = { 0, 0x2f85 - 0x2f19 };
@@ -301,6 +301,11 @@ public:
             for (int i = 0; i < 100 && (r[kBlLock + q] & 0x100); i++) IODelay(100);   // REG_UPDATE_PENDING
             any = true;
         }
+        if (level == 0) {
+            r[kBlPwrSeq] = r[kBlPwrSeq] & ~1u;   // cut PANEL_BLON
+        } else {
+            r[kBlPwrSeq] = r[kBlPwrSeq] | 1u;    // enable PANEL_BLON
+        }
         return any;
     }
     // Display sleep left the backlight lit over a black or torn frame (2026-10-25). Besides brightness 0, a connection
@@ -312,11 +317,17 @@ public:
         return backlightWrite(level);
     }
     void displayPower(bool on) {
-        if (!fBacklight || on != fBlDark) return;
-        if (!on && !(backlightRead(&fBlSaved) && backlightWrite(0))) return;
-        fBlDark = !on;
-        if (on) backlightWrite(fBlSaved);
-        fBacklight->setProperty("PhxDark", fBlDark);
+        if (!fBacklight || on == !fBlDark) return;
+        if (!on) {
+            backlightRead(&fBlSaved);
+            if (!fBlSaved) fBlSaved = kBlMax;
+            fBlDark = true;
+            backlightWrite(0);
+        } else {
+            fBlDark = false;
+            backlightWrite(fBlSaved ? fBlSaved : kBlMax);
+        }
+        if (fBacklight) fBacklight->setProperty("PhxDark", fBlDark);
         PFBLOG("backlight: display power %s, level %u", on ? "on" : "off", fBlSaved);
     }
     bool backlightDark() const { return fBlDark; }
@@ -407,6 +418,7 @@ public:
     // power and connection answers as NullMoth's NMIntelFB/NVRMFB give them: acknowledge at once, never queue on the
     // controller thread (a base-class power change waited 45 s for an acknowledge and froze WindowServer restarts)
     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
+        displayPower(ordinal != 0);
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
         return kIOPMAckImplied;
     }
@@ -561,11 +573,19 @@ public:
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
         setProperty("PhxLastParam", const_cast<OSSymbol *>(paramName)); setProperty("PhxLastValue", value, 32); setProperty("PhxSets", ++fSets, 32);
         fFB->trace(paramName->getCStringNoCopy(), 0x20202020, value);
-        setProperty("PhxDark", fFB->backlightDark());
         if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey
             && paramName != gIODisplayUsableLinearBrightnessKey) return false;
+        if (paramName == gIODisplayBrightnessKey && value == 0) {
+            fFB->displayPower(false);
+            fLevel = 0;
+            setProperty("PhxDark", fFB->backlightDark());
+            return true;
+        } else if (paramName == gIODisplayBrightnessKey && value > 0 && fFB->backlightDark()) {
+            fFB->displayPower(true);
+        }
         if (!fFB->backlightSet(value)) return false;
         fLevel = value > kBlMax ? kBlMax : value;
+        setProperty("PhxDark", fFB->backlightDark());
         return true;
     }
     bool doDataSet(const OSSymbol *, OSData *) override { return false; }
