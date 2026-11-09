@@ -11,6 +11,7 @@
 void nvlog(const char *fmt, ...);
 
 #import "NVMTLObjects.h"
+#import "nvmtl_surface_key.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 static int nvmtl_trace_on(void);
@@ -1235,7 +1236,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         id monitor = objc_getAssociatedObject(t, &key);
         if (!monitor) {
             if (!monitors) monitors = [NSMapTable strongToWeakObjectsMapTable];
-            NSArray *surface = @[@(IOSurfaceGetID(t->_surf)), @(t->_plane)];
+            id surface = nvmtl_surface_key(IOSurfaceGetID(t->_surf), t->_plane);
             monitor = [monitors objectForKey:surface];
             if (!monitor) { monitor = [NSObject new]; [monitors setObject:monitor forKey:surface]; }
             objc_setAssociatedObject(t, &key, monitor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);

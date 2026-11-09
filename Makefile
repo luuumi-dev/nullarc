@@ -54,3 +54,7 @@ kext:
 
 clean:
 	rm -rf build/
+
+.PHONY: test-nmplugin-surface-key
+test-nmplugin-surface-key:
+	python3 tests/test_nmplugin_surface_key.py
