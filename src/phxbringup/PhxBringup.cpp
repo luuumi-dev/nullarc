@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 35u
+#define PHX_KEXT_BUILD 36u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -51,11 +51,13 @@ SYSCTL_INT(_debug, OID_AUTO, phx_hang_kills, CTLFLAG_RD | CTLFLAG_LOCKED, (int *
 // one VRAM page (Linux smu_cmn_update_table) and the values below are refreshed. phx_pm_mode picks the GFX clock policy:
 // 0 = leave the PMFW defaults (telemetry only), 1 = auto (Linux AMD_DPM_FORCED_LEVEL_AUTO: HardMin = min, SoftMax = max,
 // the PMFW scales inside), 2 = governor (the kext moves SoftMax with the GFX load, for PMFWs that do not scale on their
-// own). phx_pm_gfx_min / _max narrow the range (MHz, 0 = the PMFW's DPM table). Idle at 2600 MHz the 780M cost ~20 W
-// over a 400 MHz cap here (2026-11-12, battery A/B 44-47 W vs 24.8 W).
+// own). phx_pm_gfx_max lowers the ceiling (MHz, 0 = the PMFW's DPM table). The floor is always the PMFW's own minimum:
+// a HardMin above it keeps the PMFW from pulling GFXCLK down when the package reaches its PPT/TDC limits, and on battery
+// the EC then cut the power (ACEMAGIC RX16, 2026-11-12: twice, HardMin 2600 under GPU load, ThrottlerStatus
+// FPPT|SPPT|TDC_VDD, package peaks ~60 W; the same load with the PMFW's own choice ran through).
 static int gPmMs = 250;
 static int gPmMode = 0;
-static int gPmGfxMin = 0, gPmGfxMax = 0;
+static int gPmGfxMax = 0;
 static int gPmUp = 70;          // governor: GFX busy % that goes straight to the top of the range
 static int gPmTarget = 50;      // governor: busy % a lower cap is sized for (cap = cap * busy / target)
 static int gPmStepDown = 300;   // governor: MHz the cap may fall per tick
@@ -71,7 +73,6 @@ static struct {
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMs, 0, "SMU metrics period, ms (0 off)");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMode, 0,
            "GFX clock policy: 0 PMFW defaults, 1 auto range, 2 kext governor");
-SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfx_min, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxMin, 0, "GFX floor, MHz (0 DPM table)");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfx_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxMax, 0, "GFX ceiling, MHz (0 DPM table)");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_up, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmUp, 0, "governor: busy % that jumps to max");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_target, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmTarget, 0, "governor: busy % to size the cap for");
@@ -104,7 +105,7 @@ PHX_PM_RO(phx_pm_updates, updates, "metrics tables read");
 PHX_PM_RO(phx_pm_errors, errors, "SMU messages that failed");
 PHX_PM_RO(phx_pm_vram_was_zero, vramWasZero, "the table page was clear before first use");
 static struct sysctl_oid *const kPmOids[] = {
-    &sysctl__debug_phx_pm_ms, &sysctl__debug_phx_pm_mode, &sysctl__debug_phx_pm_gfx_min, &sysctl__debug_phx_pm_gfx_max,
+    &sysctl__debug_phx_pm_ms, &sysctl__debug_phx_pm_mode, &sysctl__debug_phx_pm_gfx_max,
     &sysctl__debug_phx_pm_up, &sysctl__debug_phx_pm_target, &sysctl__debug_phx_pm_step_down,
     &sysctl__debug_phx_pm_state, &sysctl__debug_phx_pm_dpm_min, &sysctl__debug_phx_pm_dpm_max,
     &sysctl__debug_phx_pm_gfxclk, &sysctl__debug_phx_pm_gfxclk_avg, &sysctl__debug_phx_pm_busy,
@@ -1502,7 +1503,7 @@ void PhxBringup::pmPolicy(const phx_smu13_0_4_metrics &m) {
         pmCap = 0;
         return;
     }
-    const phxpm::Range r = phxpm::clampRange(gPmGfxMin, gPmGfxMax, gPm.dpmMin, gPm.dpmMax);
+    const phxpm::Range r = phxpm::clampRange(0, gPmGfxMax, gPm.dpmMin, gPm.dpmMax);
     const int lo = r.lo, hi = r.hi;
     if (mode == 1) {
         // as Linux AUTO: set the range, re-assert it every ~10 s in case a GFX power-up reset it
