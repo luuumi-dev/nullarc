@@ -38,6 +38,17 @@ static uint32_t rd(uint32_t reg)
    IOConnectCallMethod(conn, SEL_READREGS, in, 3, NULL, 0, NULL, NULL, &v, &sz);
    return v;
 }
+// GRBM/CP busy state at each bring-up step, appended to /var/log/mesboot-grbm.log (MESBOOT_GRBMLOG overrides the path):
+// where the CP stops going idle (B-34: GRBM_STATUS 0xa800302c at idle, Linux 0x0000302c).
+static void gnote(const char *what)
+{
+   const char *p = getenv("MESBOOT_GRBMLOG");
+   FILE *f = fopen(p && *p ? p : "/var/log/mesboot-grbm.log", "a");
+   if (!f) return;
+   fprintf(f, "%-22s GRBM 0x%08x GRBM2 0x%08x CPF 0x%08x CP_BUSY 0x%08x CP_STAT 0x%08x\n", what, rd(0x2004), rd(0x2002),
+           rd(0x2087), rd(0x219f), rd(0x21a0));
+   fclose(f);
+}
 static uint32_t wr(uint32_t reg, uint32_t val)
 {
    uint64_t in[2] = {reg, val}, out[1] = {0}; uint32_t n = 1;
@@ -552,14 +563,18 @@ static void sched_test(void)
    r.header.type = MES_API_TYPE_SCHEDULER;
    r.header.opcode = MES_SCH_API_SET_HW_RSRC;
    r.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
-   r.vmid_mask_mmhub = 0xffffff00;
-   r.vmid_mask_gfxhub = 0xffffff00;
+   // the masks Linux hands the MES on this APU (dmesg: vmid_mask 0x0000ff00, gfx_hqd_mask 0x00000002,
+   // compute_hqd_mask 0x0000000c, sdma_hqd_mask 0x000000fc): 16 VMIDs and two gfx queues exist, not 32 of each.
+   // MESBOOT_VMIDMASK / MESBOOT_GFXMASK set the old 0xffffff00 / 0xfffffffe for experiments.
+   const char *vm = getenv("MESBOOT_VMIDMASK"), *gm = getenv("MESBOOT_GFXMASK");
+   r.vmid_mask_mmhub = vm ? (uint32_t)strtoul(vm, NULL, 0) : 0x0000ff00;
+   r.vmid_mask_gfxhub = r.vmid_mask_mmhub;
    r.gds_size = 0;
    r.paging_vmid = 0;
    r.g_sch_ctx_gpu_mc_ptr = VA(SCH_WB + 128);
    r.query_status_fence_gpu_mc_ptr = VA(SCH_WB + 136);
    for (int i = 0; i < 4; i++) r.compute_hqd_mask[i] = 0xc;
-   r.gfx_hqd_mask[0] = 0xfffffffe;
+   r.gfx_hqd_mask[0] = gm ? (uint32_t)strtoul(gm, NULL, 0) : 0x00000002;
    r.sdma_hqd_mask[0] = 0xfc;
    const uint32_t gcb[5] = {0x1260, 0xA000, 0x2402c00, 0, 0}, mmb[5] = {0x13200, 0x1a000, 0x2408800, 0, 0}, osb[5] = {0x10a0, 0x240a000, 0, 0, 0};
    for (int i = 0; i < 5; i++) { r.gc_base[i] = gcb[i]; r.mmhub_base[i] = mmb[i]; r.osssys_base[i] = osb[i]; }
@@ -569,15 +584,18 @@ static void sched_test(void)
    // with it the MES keeps the CP busy, the PMFW reads ~99 % GFX load at idle and holds GFXCLK at its top).
    // MESBOOT_OVERSUB=<n> sets it again for experiments.
    r.oversubscription_timer = getenv("MESBOOT_OVERSUB") ? (uint32_t)strtoul(getenv("MESBOOT_OVERSUB"), NULL, 0) : 0;
+   gnote("before SET_HW_RESOURCES");
    mes_submit(&r, sizeof(r), offsetof(union MESAPI_SET_HW_RESOURCES, api_status), "SET_HW_RESOURCES");
+   usleep(20000); gnote("after SET_HW_RESOURCES");
    union MESAPI__QUERY_MES_STATUS q;
    memset(&q, 0, sizeof(q));
    q.header.type = MES_API_TYPE_SCHEDULER;
    q.header.opcode = MES_SCH_API_QUERY_SCHEDULER_STATUS;
    q.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
    mes_submit(&q, sizeof(q), offsetof(union MESAPI__QUERY_MES_STATUS, api_status), "QUERY_SCHED_STATUS");
-   if (env_on("MESBOOT_CS")) compute_via_mes();
-   if (env_on("MESBOOT_GFX")) gfx_via_mes();
+   usleep(20000); gnote("after QUERY_STATUS");
+   if (env_on("MESBOOT_CS")) { compute_via_mes(); usleep(20000); gnote("after compute queue"); }
+   if (env_on("MESBOOT_GFX")) { gfx_via_mes(); usleep(20000); gnote("after gfx queue"); }
 }
 
 #define MEC_RING 0x2530000ull
@@ -748,10 +766,11 @@ int main(int argc, char **argv)
    if (getenv("MESBOOT_MC") && *getenv("MESBOOT_MC") == '1') use_mc = 1;
    if (!strcmp(argv[1], "db") && argc >= 4) { printf("db +0x%llx <- %llu kr=0x%x\n", strtoull(argv[2], NULL, 0), strtoull(argv[3], NULL, 0), db(strtoull(argv[2], NULL, 0), strtoull(argv[3], NULL, 0))); return 0; }
    if (!strcmp(argv[1], "dump")) mesdump();
+   { char t[40]; snprintf(t, sizeof(t), "start %s", argv[1]); gnote(t); }
    if (all || !strcmp(argv[1], "gart")) gart();
-   if (all || !strcmp(argv[1], "mes")) mes_start();
+   if (all || !strcmp(argv[1], "mes")) { mes_start(); usleep(20000); gnote("after mes start"); }
    if (!strcmp(argv[1], "kiqdb")) { use_db = 1; kiq_test(); }
-   if (!strcmp(argv[1], "kiqsched")) { kiq_init_only(); sched_test(); }
+   if (!strcmp(argv[1], "kiqsched")) { kiq_init_only(); usleep(20000); gnote("after kiq init"); sched_test(); }
    if (!strcmp(argv[1], "claim")) {   // GPU is up: let PhxAccel (the Metal accelerator) start on it
       uint64_t in[1] = {1};
       printf("claim -> kr 0x%x\n", IOConnectCallScalarMethod(conn, 113, in, 1, NULL, NULL));
