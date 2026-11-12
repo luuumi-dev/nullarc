@@ -555,8 +555,24 @@ static void vm8_test(void)
    grbm_select(0, 0, 0, 0);
 }
 
+// CP state Linux sets before any queue is mapped and nullarc left at reset values (B-34):
+//  - CP_MEC_DOORBELL_RANGE stayed at its default 0x110..0xffc, which covers the gfx ring's doorbell (0x458, inside
+//    CP_RB_DOORBELL_RANGE 0x458..0x7f8); Linux (gfx_v11_0_cp_set_doorbell_range) gives compute 0x0..0x450.
+//  - CP_MAX_CONTEXT 7 and CP_DEVICE_ID 1 (gfx_v11_0_cp_gfx_start).
+// From the gfx queue's creation on the CP never went idle again (GRBM_STATUS 0xa800302c, CPF POST_WPTR_GFX_BUSY |
+// CPF_CMP_BUSY); writing these afterwards does not release it, so they go in before. MESBOOT_LEGACY_INIT=1 skips them.
+static void linux_cp_init(void)
+{
+   if (env_on("MESBOOT_LEGACY_INIT")) { gnote("legacy init (skipped)"); return; }
+   wr(SEG0(0x1dfd), 0x450); wr(SEG0(0x1dfc), 0);   // CP_MEC_DOORBELL_RANGE_UPPER / _LOWER
+   wr(SEG0(0x1e4e), 7);                            // CP_MAX_CONTEXT
+   wr(SEG0(0x1deb), 1);                            // CP_DEVICE_ID
+   gnote("after linux cp init");
+}
+
 static void sched_test(void)
 {
+   linux_cp_init();
    sched_init();
    union MESAPI_SET_HW_RESOURCES r;
    memset(&r, 0, sizeof(r));
@@ -672,6 +688,7 @@ static void gfx_via_mes(void)
    a.queue_type = MES_QUEUE_TYPE_GFX;
    a.map_legacy_kq = 1;
    if (mes_submit(&a, sizeof(a), offsetof(union MESAPI__ADD_QUEUE, api_status), "ADD_QUEUE(gfx, map_legacy_kq)")) return;
+   usleep(20000); gnote("gfx mapped, ring empty");
    grbm_select(0, 0, 0, 0);
    printf("gfx hqd after map: active=%u base=0x%x cntl=0x%08x dbctl=0x%08x rptr=%u\n", rd(SEG0(0x1e80)), rd(SEG0(0x1e86)),
           rd(SEG0(0x1e8f)), rd(SEG0(0x1e8d)), rd(SEG0(0x1e88)));
