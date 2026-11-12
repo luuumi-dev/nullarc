@@ -565,7 +565,10 @@ static void sched_test(void)
    for (int i = 0; i < 5; i++) { r.gc_base[i] = gcb[i]; r.mmhub_base[i] = mmb[i]; r.osssys_base[i] = osb[i]; }
    r.disable_reset = 1; r.disable_mes_log = 1; r.use_different_vmid_compute = 1;
    r.enable_reg_active_poll = 1; r.enable_level_process_quantum_check = 1;
-   r.oversubscription_timer = 50;
+   // No oversubscription timer (Linux mes_v11_0_set_hw_resources does not arm it on bare metal; a6571045 for gfx12:
+   // with it the MES keeps the CP busy, the PMFW reads ~99 % GFX load at idle and holds GFXCLK at its top).
+   // MESBOOT_OVERSUB=<n> sets it again for experiments.
+   r.oversubscription_timer = getenv("MESBOOT_OVERSUB") ? (uint32_t)strtoul(getenv("MESBOOT_OVERSUB"), NULL, 0) : 0;
    mes_submit(&r, sizeof(r), offsetof(union MESAPI_SET_HW_RESOURCES, api_status), "SET_HW_RESOURCES");
    union MESAPI__QUERY_MES_STATUS q;
    memset(&q, 0, sizeof(q));
