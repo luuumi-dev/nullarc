@@ -982,10 +982,10 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // frame, a sixth of WindowServer's frame time, 2026-10-21). The backing holds the surface, so its ID cannot be reused
 // while the entry stands; entries whose surface only the backing still holds are dropped at the next insert.
 // Called under @synchronized(device).
-static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
+static void nvmtl_surface_keep(id dev, NSString *key, NVMTLTexture *t) {
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-    for (NSArray *k in keep.allKeys) {
+    for (NSString *k in keep.allKeys) {
         NVMTLTexture *b = keep[k];
         if (!b->_surf || CFGetRetainCount(b->_surf) <= 1) [keep removeObjectForKey:k];
     }
@@ -1011,7 +1011,17 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    // The key is a string: an NSArray hashes to its count, so every 7-element key landed in one bucket and each lookup
+    // compared it against all the others (NSArray isEqualToArray / NSNumber compare at the top of the profile). A client
+    // that wraps a new surface per frame - VideoToolbox's Metal transfer for a camera - slowed down frame by frame,
+    // 4.7 fps falling to 3.5 within twenty seconds in Tencent Meeting. Dead entries of the weak cache are swept too.
+    NSString *key = surf ? [NSString stringWithFormat:@"%u/%lu/%zux%zu/%lu/%lu/%d", (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h,
+                            (unsigned long)d.pixelFormat, (unsigned long)t->_ropt, (int)t->_fbo] : nil;
+    if (key && cache.count > 256) {
+        NSMutableArray *dead = [NSMutableArray new];
+        for (NSString *k in cache) if (![cache objectForKey:k]) [dead addObject:k];
+        for (NSString *k in dead) [cache removeObjectForKey:k];
+    }
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
