@@ -291,6 +291,10 @@ typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_p
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
 @interface NVMTLTexture () { @public BOOL _bparkable; } @end
+// MTLTextureDescriptor.isDrawable as the texture was made: CAMetalLayer sets it on its drawables' descriptors and
+// CoreImage flips its output for such a destination (-[CIRenderDestination initWithMTLTexture:commandBuffer:] calls
+// setFlipped:[texture isDrawable]). Apple's MTLIOAccelTexture copies the flag in every init; views take the parent's.
+@interface NVMTLTexture () { @public BOOL _drawable; } @end
 // a private image standing in for a buffer texture RADV will not alias: refilled from _backBuf when the buffer's bytes
 // change (_bufHash), written back after the GPU draws into it
 @interface NVMTLTexture () { @public BOOL _bufCopy, _bufHashed; uint64_t _bufHash; } @end
