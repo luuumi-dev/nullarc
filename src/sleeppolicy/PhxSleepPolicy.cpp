@@ -1,6 +1,6 @@
-// WujieSleepPolicy: makes every system sleep a hibernation on a machine whose firmware has no working S3.
+// PhxSleepPolicy: makes every system sleep a hibernation on a machine whose firmware has no working S3.
 //
-// The MECHREVO WUJIE15XA (Phoenix, Modern Standby only) hides _S3 (XS3 in the DSDT). With the name patched back, macOS
+// Phoenix laptops are Modern Standby only: the firmware hides _S3 (XS3 in the DSDT; seen on the MECHREVO WUJIE15XA). With the name patched back, macOS
 // starts sleeping, X86PlatformPlugin's policy picks kIOPMSleepTypeDeepIdle, hibernation setup is skipped and the
 // platform enters S3 - from which this firmware never wakes. IOPMrootDomain takes one policy handler, first come first
 // served; this kext installs its own before the platform plugin and always answers "hibernate" (image written, power
@@ -23,11 +23,11 @@ struct SleepParams {           // IOPMSystemSleepParameters, version 2
 enum { kTypeAborted = 1, kTypeNormal = 2, kTypeSafeSleep = 3, kTypeHibernate = 4, kHibOn = 1, kHibSleep = 2 };
 
 static int gInstalled, gCalls, gLastType, gLastMode, gAllowS3;
-SYSCTL_INT(_debug, OID_AUTO, wujiesleep_installed, CTLFLAG_RD, &gInstalled, 0, "1 = our sleep policy handler is the system's, -1 = another one was first");
-SYSCTL_INT(_debug, OID_AUTO, wujiesleep_calls, CTLFLAG_RD, &gCalls, 0, "");
-SYSCTL_INT(_debug, OID_AUTO, wujiesleep_last_type, CTLFLAG_RD, &gLastType, 0, "sleep type of the last answer");
-SYSCTL_INT(_debug, OID_AUTO, wujiesleep_last_mode, CTLFLAG_RD, &gLastMode, 0, "hibernate mode seen last");
-SYSCTL_INT(_debug, OID_AUTO, wujiesleep_allow_s3, CTLFLAG_RW, &gAllowS3, 0, "1 = answer normal sleep when hibernation is off (hangs on this firmware)");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_installed, CTLFLAG_RD, &gInstalled, 0, "1 = our sleep policy handler is the system's, -1 = another one was first");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_calls, CTLFLAG_RD, &gCalls, 0, "");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_last_type, CTLFLAG_RD, &gLastType, 0, "sleep type of the last answer");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_last_mode, CTLFLAG_RD, &gLastMode, 0, "hibernate mode seen last");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_allow_s3, CTLFLAG_RW, &gAllowS3, 0, "1 = answer normal sleep when hibernation is off (hangs on this firmware)");
 
 static IOReturn policy(void *, const PolicyVars *vars, SleepParams *params) {
     if (!vars || !params) return kIOReturnBadArgument;
@@ -45,7 +45,7 @@ static IOReturn policy(void *, const PolicyVars *vars, SleepParams *params) {
 // boot.efi and OpenCore also accept the same bytes from the NVRAM variable of that name, so once a sleep starts the
 // property is copied to NVRAM and synced (what HibernationFixup does by hooking the kernel; it did not on this macOS).
 static int gKeyWrites, gCapMsgs;
-SYSCTL_INT(_debug, OID_AUTO, wujiesleep_key_writes, CTLFLAG_RD, &gKeyWrites, 0, "hibernation key copies written to NVRAM");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_key_writes, CTLFLAG_RD, &gKeyWrites, 0, "hibernation key copies written to NVRAM");
 // Called from setPowerState(0). The order inside a sleep is: priority notifications -> willNotifyPowerChildren, where
 // IOHibernateSystemSleep() creates the key property -> the root domain's children power down (this service is one) ->
 // IOHibernateSystemHasSlept() stores boot-image and syncs NVRAM -> the image is written. So the property exists by
@@ -68,7 +68,7 @@ static void copyKey(void) {
         }
         // what happened, readable after the next boot: "<capability messages> <key length> <key copies>"
         char note[48]; snprintf(note, sizeof note, "%d %u %d", gCapMsgs, d ? d->getLength() : 0, gKeyWrites);
-        const OSSymbol *nk = OSSymbol::withCString("wujie-sleep-note");
+        const OSSymbol *nk = OSSymbol::withCString("phx-sleep-note");
         OSData *nd = OSData::withBytes(note, (unsigned int)strlen(note));
         if (nk && nd) nv->setProperty(nk, nd);
         if (nd) nd->release();
@@ -78,26 +78,26 @@ static void copyKey(void) {
     if (o) o->release();
 }
 
-class WujieSleepPolicy : public IOService {
-    OSDeclareDefaultStructors(WujieSleepPolicy)
+class PhxSleepPolicy : public IOService {
+    OSDeclareDefaultStructors(PhxSleepPolicy)
 public:
     bool start(IOService *provider) override;
     IOReturn setPowerState(unsigned long ordinal, IOService *whatDevice) override;
 };
-OSDefineMetaClassAndStructors(WujieSleepPolicy, IOService)
+OSDefineMetaClassAndStructors(PhxSleepPolicy, IOService)
 
-bool WujieSleepPolicy::start(IOService *provider) {
+bool PhxSleepPolicy::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
-    sysctl_register_oid(&sysctl__debug_wujiesleep_installed); sysctl_register_oid(&sysctl__debug_wujiesleep_calls);
-    sysctl_register_oid(&sysctl__debug_wujiesleep_last_type); sysctl_register_oid(&sysctl__debug_wujiesleep_last_mode);
-    sysctl_register_oid(&sysctl__debug_wujiesleep_allow_s3);
+    sysctl_register_oid(&sysctl__debug_phxsleep_installed); sysctl_register_oid(&sysctl__debug_phxsleep_calls);
+    sysctl_register_oid(&sysctl__debug_phxsleep_last_type); sysctl_register_oid(&sysctl__debug_phxsleep_last_mode);
+    sysctl_register_oid(&sysctl__debug_phxsleep_allow_s3);
     IOPMrootDomain *root = getPMRootDomain();
     const OSSymbol *fn = OSSymbol::withCString("IOPMInstallSystemSleepPolicyHandler");
     IOReturn r = (root && fn) ? root->callPlatformFunction(fn, false, (void *)&policy, this, nullptr, nullptr) : kIOReturnNotReady;
     if (fn) fn->release();
     gInstalled = r == kIOReturnSuccess ? 1 : -1;
-    IOLog("WujieSleepPolicy: install -> 0x%x (%s)\n", r, r == kIOReturnSuccess ? "ours" : "another handler was first");
-    sysctl_register_oid(&sysctl__debug_wujiesleep_key_writes);
+    IOLog("PhxSleepPolicy: install -> 0x%x (%s)\n", r, r == kIOReturnSuccess ? "ours" : "another handler was first");
+    sysctl_register_oid(&sysctl__debug_phxsleep_key_writes);
     static IOPMPowerState states[2] = {
         { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 } };
@@ -106,7 +106,7 @@ bool WujieSleepPolicy::start(IOService *provider) {
     return true;
 }
 
-IOReturn WujieSleepPolicy::setPowerState(unsigned long ordinal, IOService *) {
+IOReturn PhxSleepPolicy::setPowerState(unsigned long ordinal, IOService *) {
     if (ordinal == 0) copyKey();
     return kIOPMAckImplied;
 }
