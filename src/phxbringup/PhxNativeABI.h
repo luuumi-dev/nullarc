@@ -141,6 +141,46 @@ enum {
 #define PHX_PPSMC_SetSoftMaxSocclkByFreq 0x1Du
 #define PHX_PPSMC_SetSoftMaxFclkByFreq 0x1Eu
 #define PHX_PPSMC_SetHardMinFclkByFreq 0x23u
+/* driver table (smu_v13_0_set_driver_table_location / smu_cmn_update_table) */
+#define PHX_PPSMC_SetDriverDramAddrHigh 0x0Du
+#define PHX_PPSMC_SetDriverDramAddrLow  0x0Eu
+#define PHX_PPSMC_TransferTableSmu2Dram 0x0Fu
+#define PHX_PPSMC_Result_OK             0x01u
+#define PHX_SMU13_0_4_DRIVER_IF_VERSION 8u     /* SMU13_0_4_DRIVER_IF_VERSION, smu13_driver_if_v13_0_4.h */
+#define PHX_SMU_TABLE_DPMCLOCKS   4u
+#define PHX_SMU_TABLE_SMU_METRICS 7u
+/* One VRAM page the SMU writes its tables into (Linux keeps the driver table in VRAM too). 18 MiB: between the PSP
+ * ring/cmd/fence (17 MiB + 36 KiB) and the TMR (20 MiB), inside the region the bring-up already owns. */
+#define PHX_VRAM_SMU_TABLE_OFF 0x1200000ull
+
+/* SmuMetrics_t of smu13_driver_if_v13_0_4.h (DriverIf 8), byte for byte. Units as there: MHz, mW, centi-%, centi-°C. */
+struct phx_smu13_0_4_metrics {
+    uint16_t GfxclkFrequency, SocclkFrequency, VclkFrequency, DclkFrequency, MemclkFrequency, spare;
+    uint16_t GfxActivity, UvdActivity;
+    uint16_t Voltage[2], Current[2], Power[2];          /* [0] VDDCR_VDD, [1] VDDCR_SOC */
+    uint16_t CoreFrequency[8], CorePower[8], CoreTemperature[8];
+    uint16_t L3Frequency, L3Temperature;
+    uint16_t GfxTemperature, SocTemperature, ThrottlerStatus;
+    uint16_t CurrentSocketPower, StapmOpnLimit, StapmCurrentLimit;
+    uint32_t ApuPower, dGpuPower;
+    uint16_t VddTdcValue, SocTdcValue, VddEdcValue, SocEdcValue;
+    uint16_t InfrastructureCpuMaxFreq, InfrastructureGfxMaxFreq;
+    uint16_t SkinTemp, DeviceState, CurTemp, FilterAlphaValue;
+    uint16_t AverageGfxclkFrequency, AverageFclkFrequency, AverageGfxActivity, AverageSocclkFrequency;
+    uint16_t AverageVclkFrequency, AverageVcnActivity, AverageDRAMReads, AverageDRAMWrites;
+    uint16_t AverageSocketPower, AverageCorePower;
+    uint16_t AverageCoreC0Residency[8];
+    uint32_t MetricsCounter;
+};
+/* DpmClocks_t: only the GFX range is read (MinGfxClk at +296, MaxGfxClk at +300, 304 bytes in all). */
+#define PHX_SMU_DPMCLOCKS_SIZE        304u
+#define PHX_SMU_DPMCLOCKS_MINGFX_OFF  296u
+#ifdef __cplusplus
+static_assert(sizeof(phx_smu13_0_4_metrics) == 160, "SmuMetrics_t is 160 bytes");
+static_assert(__builtin_offsetof(phx_smu13_0_4_metrics, ApuPower) == 92, "ApuPower at 92");
+static_assert(__builtin_offsetof(phx_smu13_0_4_metrics, AverageGfxclkFrequency) == 120, "averages at 120");
+static_assert(__builtin_offsetof(phx_smu13_0_4_metrics, MetricsCounter) == 156, "MetricsCounter at 156");
+#endif
 
 /* n48n_info.flags */
 #define PHXN_INFO_HUNG         (1u << 0)

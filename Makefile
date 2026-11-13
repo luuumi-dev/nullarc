@@ -10,7 +10,8 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_rdna3_ucode \
         $(TEST_BIN_DIR)/test_r3n_abi \
         $(TEST_BIN_DIR)/test_phx_topology \
-        $(TEST_BIN_DIR)/test_wait_seq
+        $(TEST_BIN_DIR)/test_wait_seq \
+        $(TEST_BIN_DIR)/test_phx_smu_pm
 
 .PHONY: all test clean kext fixtures
 
@@ -21,6 +22,9 @@ $(TEST_BIN_DIR):
 
 $(TEST_BIN_DIR)/test_wait_seq: tests/test_wait_seq.cpp | $(TEST_BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ -lpthread
+
+$(TEST_BIN_DIR)/test_phx_smu_pm: tests/test_phx_smu_pm.cpp src/amd/phx_smu_pm.h | $(TEST_BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/test_phx_smu_pm.cpp -o $@
 
 $(TEST_BIN_DIR)/test_phx_topology: tests/test_phx_topology.cpp | $(TEST_BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@

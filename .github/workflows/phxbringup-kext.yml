@@ -1,0 +1,49 @@
+name: PhxBringup kext
+
+# Builds PhxBringup.kext with the Command Line Tools on a macOS runner (src/phxbringup/build.sh against
+# acidanthera/MacKernelSDK) and keeps the bundle as an artifact, so a kext change can be tested without a Mac build tree.
+
+on:
+  push:
+    paths:
+      - "src/phxbringup/**"
+      - "src/amd/phx_topology.h"
+      - "src/amd/phx_smu_pm.h"
+      - ".github/workflows/phxbringup-kext.yml"
+  pull_request:
+    paths:
+      - "src/phxbringup/**"
+      - "src/amd/phx_topology.h"
+      - "src/amd/phx_smu_pm.h"
+  workflow_dispatch:
+
+jobs:
+  kext:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MacKernelSDK
+        run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git "$RUNNER_TEMP/MacKernelSDK"
+
+      - name: Build
+        run: sh src/phxbringup/build.sh "$RUNNER_TEMP/MacKernelSDK"
+
+      - name: Check the bundle
+        run: |
+          K=src/phxbringup/build/PhxBringup.kext
+          file "$K/Contents/MacOS/PhxBringup"
+          lipo -archs "$K/Contents/MacOS/PhxBringup" | grep -qx x86_64
+          plutil -lint "$K/Contents/Info.plist"
+          # the kext must export its class and the SMU power-management entry points
+          nm -gU "$K/Contents/MacOS/PhxBringup" | grep -q "_kmod_info"
+          nm "$K/Contents/MacOS/PhxBringup" | grep -q "PhxBringup6pmStep"
+          shasum -a 256 "$K/Contents/MacOS/PhxBringup" | tee "$RUNNER_TEMP/sha256.txt"
+          cd src/phxbringup/build && ditto -c -k --keepParent PhxBringup.kext "$RUNNER_TEMP/PhxBringup.kext.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhxBringup-kext-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/PhxBringup.kext.zip
+            ${{ runner.temp }}/sha256.txt
