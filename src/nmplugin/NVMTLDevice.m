@@ -1023,9 +1023,8 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
         if (promote < 0) { const char *me = getprogname();
             promote = !getenv("NVMTL_NO_SURF_UNKNOWN") && !(me && !strcmp(me, "WindowServer"));
             nvlog("surface textures: usage Unknown promoted to every use %s", promote ? "ON" : "OFF"); }
-        // One plane only: a camera frame's planes (420v, usage Unknown too) are read, never drawn to, and a writable
-        // wrapper of a multi-plane surface is a private image copied back over the frame - Tencent Meeting's camera
-        // picture broke up with it.
+        // One plane only, to keep this narrow: the planes of a camera frame (420v) arrive with usage Unknown too, are
+        // only read, and a writable wrapper of a multi-plane surface is a private image that gets copied back.
         if (promote && surf && d.usage == MTLTextureUsageUnknown && IOSurfaceGetPlaneCount(surf) <= 1) {
             MTLTextureDescriptor *pd = [d copy];
             pd.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView
