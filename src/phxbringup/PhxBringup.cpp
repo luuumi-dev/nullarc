@@ -25,6 +25,7 @@
 #include "PhxNativeABI.h"
 
 #define PHX_KEXT_BUILD 34u
+#include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -65,12 +66,70 @@ static_assert(sizeof(PhxGfxRbFrame) == 64, "PhxGfxRbFrame must be 64 B");
 static constexpr uint32_t kGbAddrConfig = 0x00000242;
 static constexpr uint32_t kGcVersion = (11u << 16) | (0u << 8) | 1u;
 
-// Pools reported to RADV. E1 backs every BO with system memory, so these are budgets, not hardware:
-// BAR0 is 256 MiB on this machine, the UMA carve-out 6 GiB.
-static constexpr uint64_t kVisTotal = 256ull << 20;
-static constexpr uint64_t kHiTotal = 1536ull << 20;
-static constexpr uint64_t kGttCap = 512ull << 20;
-static constexpr uint64_t kGttMaxBo = 256ull << 20;
+// Pools reported to RADV. E1 backs every BO with system memory, so these are budgets, not hardware; a CPU mapping of
+// any BO is its own pages (clientMemoryForType), never BAR0. Build 37 gave each client 256 MiB CPU-visible + 1.5 GiB
+// + 512 MiB GTT: WindowServer filled them with 1.27 GiB of images after 2.5 h, texture creation failed and CoreDisplay
+// aborted (2026-11-13 00:59), and Safari's GPU process ran the visible pool dry playing video, so RADV's shader arena
+// got no memory and radv_shader_create returned NULL into a crash. The machine itself (16 GiB, 4 GiB carve-out) has
+// room: per-client budgets are larger now, and gMemCapMb bounds what all clients wire together.
+static constexpr uint64_t kVisTotal = 1024ull << 20;
+static constexpr uint64_t kHiTotal = 3072ull << 20;
+static constexpr uint64_t kGttCap = 2048ull << 20;
+static constexpr uint64_t kGttMaxBo = 512ull << 20;
+
+// debug.phx_mem_*: wired BO memory across every client (BOs and host imports), its cap, and why allocations were
+// refused, so a "VRAM full" in an app can be traced to the limit that said no.
+static volatile SInt64 gMemBytes, gMemPeak;
+static int gMemCapMb = 6144;
+static volatile SInt32 gMemRefVis, gMemRefHi, gMemRefGtt, gMemRefCap, gMemRefHandles, gMemRefMaps, gMemRefPt,
+    gMemRefAlloc, gMemRefHost, gMemRefLogged;
+SYSCTL_QUAD(_debug, OID_AUTO, phx_mem_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gMemBytes,
+            "bytes of BOs and host imports held by all clients");
+SYSCTL_QUAD(_debug, OID_AUTO, phx_mem_peak, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gMemPeak, "peak of phx_mem_bytes");
+SYSCTL_INT(_debug, OID_AUTO, phx_mem_cap_mb, CTLFLAG_RW | CTLFLAG_LOCKED, &gMemCapMb, 0,
+           "MiB all clients may hold together (0 no cap)");
+#define PHX_MEM_RO(name, var, desc) SYSCTL_INT(_debug, OID_AUTO, name, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&var, 0, desc)
+PHX_MEM_RO(phx_mem_ref_vis, gMemRefVis, "VRAM BOs refused: the client's CPU-visible pool was full");
+PHX_MEM_RO(phx_mem_ref_hi, gMemRefHi, "VRAM BOs refused: both of the client's VRAM pools were full");
+PHX_MEM_RO(phx_mem_ref_gtt, gMemRefGtt, "GTT BOs refused: the client's GTT pool was full or the BO too big");
+PHX_MEM_RO(phx_mem_ref_cap, gMemRefCap, "BOs refused by phx_mem_cap_mb");
+PHX_MEM_RO(phx_mem_ref_handles, gMemRefHandles, "BOs refused: the client had no free handle");
+PHX_MEM_RO(phx_mem_ref_maps, gMemRefMaps, "GPU mappings refused: the client had no free map slot");
+PHX_MEM_RO(phx_mem_ref_pt, gMemRefPt, "GPU mappings refused: the client's page tables were full");
+PHX_MEM_RO(phx_mem_ref_alloc, gMemRefAlloc, "BOs refused: the kernel had no memory for them");
+PHX_MEM_RO(phx_mem_ref_host, gMemRefHost, "host imports refused: the client's import budget was full");
+static struct sysctl_oid *const kMemOids[] = {
+    &sysctl__debug_phx_mem_bytes, &sysctl__debug_phx_mem_peak, &sysctl__debug_phx_mem_cap_mb,
+    &sysctl__debug_phx_mem_ref_vis, &sysctl__debug_phx_mem_ref_hi, &sysctl__debug_phx_mem_ref_gtt,
+    &sysctl__debug_phx_mem_ref_cap, &sysctl__debug_phx_mem_ref_handles, &sysctl__debug_phx_mem_ref_maps,
+    &sysctl__debug_phx_mem_ref_pt, &sysctl__debug_phx_mem_ref_alloc, &sysctl__debug_phx_mem_ref_host,
+};
+// Counts a refusal; the first few are logged with the calling process (externalMethod runs on the caller's thread).
+static void memRefused(volatile SInt32 *counter, const char *why, uint64_t size) {
+    OSIncrementAtomic(counter);
+    if (OSIncrementAtomic(&gMemRefLogged) < 32) {
+        char name[32] = {};
+        proc_selfname(name, sizeof(name));
+        IOLog("PhxBringup: %s refused %llu KiB for %s[%d] (all clients hold %lld MiB, cap %d MiB)\n", why,
+              (unsigned long long)(size >> 10), name, proc_selfpid(), (long long)(gMemBytes >> 20), gMemCapMb);
+    }
+}
+// Takes size from the all-client budget; false (counted) when the cap says no.
+static bool memCharge(uint64_t size) {
+    const int capMb = gMemCapMb;
+    if (capMb > 0 && static_cast<uint64_t>(gMemBytes) + size > (static_cast<uint64_t>(capMb) << 20)) {
+        memRefused(&gMemRefCap, "phx_mem_cap_mb", size);
+        return false;
+    }
+    const SInt64 now = OSAddAtomic64(static_cast<SInt64>(size), &gMemBytes) + static_cast<SInt64>(size);
+    for (SInt64 peak = gMemPeak; now > peak; peak = gMemPeak)
+        if (OSCompareAndSwap64(static_cast<UInt64>(peak), static_cast<UInt64>(now), reinterpret_cast<volatile UInt64 *>(&gMemPeak)))
+            break;
+    return true;
+}
+static void memUncharge(uint64_t size) {
+    OSAddAtomic64(-static_cast<SInt64>(size), &gMemBytes);
+}
 static constexpr uint64_t kHostCap = 4096ull << 20, kHostMaxBo = 1024ull << 20;   // host imports, per client
 static constexpr uint64_t kVaMask = (1ull << 48) - 1;
 static constexpr int kMaxMaps = 4096;
@@ -178,7 +237,7 @@ private:
     // A context's page tables, in physically contiguous 64 KiB chunks allocated as it maps (most contexts need one or
     // two): a single 4 MiB contiguous pool per context failed once memory was fragmented. Table i is page i % 16 of
     // chunk i / 16; table 0 is the root.
-    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 64;
+    static constexpr uint32_t kPtChunkBytes = 64u << 10, kPtChunkPages = kPtChunkBytes / 4096, kPtChunks = 256;
     struct VmCtx {
         IOBufferMemoryDescriptor *chunk[kPtChunks];
         uint64_t chunkPhys[kPtChunks];
@@ -382,6 +441,8 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        for (struct sysctl_oid *o : kMemOids)
+            sysctl_unregister_oid(o);
         gSysctlUp = 0;
     }
     clearRing();
@@ -614,8 +675,11 @@ uint64_t *PhxBringup::vmPte(VmCtx &c, uint64_t va, bool alloc) {
             return nullptr;
         uint64_t *e = t + ((va >> shift) & 511);
         if (!(*e & 1)) {
-            if (!alloc || c.used >= c.pages)
+            if (!alloc || c.used >= c.pages) {
+                if (alloc)
+                    OSIncrementAtomic(&gMemRefPt);
                 return nullptr;
+            }
             const uint64_t child = ptTablePhys(c, c.used);
             if (!child)
                 return nullptr;
@@ -1312,6 +1376,8 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        for (struct sysctl_oid *o : kMemOids)
+            sysctl_register_oid(o);
     }
     if (type != PHXN_UC_TYPE)
         return kIOReturnBadArgument;
@@ -1564,24 +1630,31 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
     if (f & (PHX_AMDGPU_GEM_CREATE_ENCRYPTED | PHX_AMDGPU_GEM_CREATE_CP_MQD_GFX9 | PHX_AMDGPU_GEM_CREATE_PREEMPTIBLE))
         return kIOReturnUnsupported;
 
-    uint32_t domain, bits;
-    uint64_t *pool;
+    // VRAM the CPU never touches goes to the high pool first, so the CPU-visible pool stays for what needs it (RADV's
+    // shader arena, upload and readback buffers): build 37 filled the visible pool first with everything. A BO that
+    // also names GTT falls back to it when both VRAM pools are full.
+    uint32_t domain = 0, bits = 0;
+    uint64_t *pool = nullptr;
+    const bool gttOk = (d & PHX_AMDGPU_GEM_DOMAIN_GTT) && size <= kGttMaxBo && gttUsed + size <= kGttCap;
     if (d & PHX_AMDGPU_GEM_DOMAIN_VRAM) {
-        if (visUsed + size <= kVisTotal) {
-            domain = 4;
-            bits = PHXN_PLACED_CPU_MAPPABLE | PHXN_PLACED_ZEROED;
-            pool = &visUsed;
-        } else if ((f & PHX_AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(f & PHX_AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) &&
-                   hiUsed + size <= kHiTotal) {
+        const bool noCpu = (f & PHX_AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(f & PHX_AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
+        if (noCpu && hiUsed + size <= kHiTotal) {
             domain = 4;
             bits = PHXN_PLACED_HI_POOL | PHXN_PLACED_ZEROED;
             pool = &hiUsed;
-        } else {
+        } else if (visUsed + size <= kVisTotal) {
+            domain = 4;
+            bits = PHXN_PLACED_CPU_MAPPABLE | PHXN_PLACED_ZEROED;
+            pool = &visUsed;
+        } else if (!gttOk) {
+            memRefused(noCpu ? &gMemRefHi : &gMemRefVis, noCpu ? "VRAM (both pools full)" : "CPU-visible VRAM", size);
             return kIOReturnNoMemory;
         }
-    } else {
-        if (size > kGttMaxBo || gttUsed + size > kGttCap)
-            return kIOReturnNoMemory;
+    } else if (!gttOk) {
+        memRefused(&gMemRefGtt, "GTT", size);
+        return kIOReturnNoMemory;
+    }
+    if (!pool) {
         domain = 2;
         bits = PHXN_PLACED_ZEROED;
         pool = &gttUsed;
@@ -1590,8 +1663,12 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
     uint32_t h = 1;
     while (h < PHXN_MAX_BOS && bos[h].md)
         h++;
-    if (h >= PHXN_MAX_BOS)
+    if (h >= PHXN_MAX_BOS) {
+        memRefused(&gMemRefHandles, "BO handle", size);
         return kIOReturnNoResources;
+    }
+    if (!memCharge(size))
+        return kIOReturnNoMemory;
 
     // Page alignment only: the GPU maps BOs page by page, and the client picks the VA (GEMVA) with its own alignment.
     // Handed to IOBufferMemoryDescriptor, RADV's 64 KiB..2 MiB alignment made every allocation PHYSICALLY CONTIGUOUS
@@ -1600,8 +1677,11 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
     (void)align;
     IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(
         kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
-    if (!md)
+    if (!md) {
+        memUncharge(size);
+        memRefused(&gMemRefAlloc, "kernel allocation", size);
         return kIOReturnNoMemory;
+    }
     bzero(md->getBytesNoCopy(), size);
     *pool += size;
     bos[h] = Bo{md, size, domain, bits, static_cast<uint8_t *>(md->getBytesNoCopy()), false};
@@ -1638,6 +1718,7 @@ void IOAccelPhxNativeClient::boRelease(Bo &b) {
     if (b.host)
         b.md->complete();
     b.md->release();
+    memUncharge(b.size);
     b = Bo{};
 }
 
@@ -1652,19 +1733,28 @@ IOReturn IOAccelPhxNativeClient::doBoImportHost(IOExternalMethodArguments *a) {
     const uint64_t va = a->scalarInput[0], size = a->scalarInput[1];
     if (!va || !size || (va & 4095) || (size & 4095) || a->scalarInput[2] || a->scalarInput[3] || !task)
         return kIOReturnBadArgument;
-    if (size > kHostMaxBo || hostUsed + size > kHostCap)
+    if (size > kHostMaxBo || hostUsed + size > kHostCap) {
+        memRefused(&gMemRefHost, "host import", size);
         return kIOReturnNoMemory;
+    }
     uint32_t h = 1;
     while (h < PHXN_MAX_BOS && bos[h].md)
         h++;
-    if (h >= PHXN_MAX_BOS)
+    if (h >= PHXN_MAX_BOS) {
+        memRefused(&gMemRefHandles, "BO handle (host import)", size);
         return kIOReturnNoResources;
-    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(va, size, kIODirectionInOut, task);
-    if (!md)
+    }
+    if (!memCharge(size))
         return kIOReturnNoMemory;
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(va, size, kIODirectionInOut, task);
+    if (!md) {
+        memUncharge(size);
+        return kIOReturnNoMemory;
+    }
     const IOReturn r = md->prepare();
     if (r != kIOReturnSuccess) {
         md->release();
+        memUncharge(size);
         return r;
     }
     hostUsed += size;
@@ -1713,8 +1803,10 @@ IOReturn IOAccelPhxNativeClient::doGemVa(IOExternalMethodArguments *a) {
             if (va < maps[i].va + maps[i].size && maps[i].va < va + v->map_size)
                 return kIOReturnBadArgument;
         }
-        if (freei < 0)
+        if (freei < 0) {
+            memRefused(&gMemRefMaps, "GPU map slot", v->map_size);
             return kIOReturnNoMemory;
+        }
         maps[freei] = Map{true, v->handle, va, v->map_size, v->offset_in_bo, v->flags};
         if (owner->gpuReady()) {
             const IOReturn r = ensureVmid() ? owner->vmMap(vmid, va, b->md, v->offset_in_bo, v->map_size) : kIOReturnNoResources;
