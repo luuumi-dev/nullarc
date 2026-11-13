@@ -382,6 +382,23 @@ public:
         fDM->display_mode_did_change(0);
         reportPipeGates("after deliverModeChange");
     }
+    // debug.nvaccelfb=9, after a wake from system sleep. The display machine took a display_mode_will_change when the
+    // framebuffer announced the sleep and waits for the matching did_change, which a framebuffer that handles its power
+    // state itself never sends: the nest count stays at 1, the accelerator stays disabled (enabled bit clear, pipe not
+    // active) and every display pipe transaction of WindowServer fails with kIOReturnNotReady - the panel keeps the
+    // boot loader's image while WindowServer renders happily. Close the open mode changes, then enable.
+    void resumeDisplay() {
+        if (!fDM) return;
+        if (fRegLock) IOLockLock(fRegLock);
+        uint8_t *dm = (uint8_t *)fDM;
+        for (int i = 0; i < 4 && *(const volatile uint32_t *)(dm + 0x10c) > 0; i++) {
+            ALOG("  resume: closing an open mode change (nest %u)", *(const volatile uint32_t *)(dm + 0x10c));
+            fDM->display_mode_did_change(0);
+        }
+        if (!(*(const volatile uint8_t *)((const uint8_t *)this + 0xc78) & 0x2)) enableFromHook("resume");
+        reportPipeGates("after resume");
+        if (fRegLock) IOLockUnlock(fRegLock);
+    }
     void reportPipeGates(const char *when) {
         uint8_t accelFlags = *(const volatile uint8_t *)((const uint8_t *)this + 0xc78);
         ALOG("  GATES %s: accel+0xc78 = 0x%02x (enabled bit 0x2 %s)",
@@ -586,6 +603,7 @@ public:
     }
     static void triggerFromSysctl(int how) {
         if (!gAccel) { ALOG("sysctl debug.nvaccelfb=%d but no NVAccel is running", how); return; }
+        if (how == 9) { gAccel->resumeDisplay(); return; }
         if (how >= 4) gNvAperture = 1;
         if (how >= 3) {
             gNvScanout = 1;

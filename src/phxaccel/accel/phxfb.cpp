@@ -410,6 +410,25 @@ public:
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
         return kIOPMAckImplied;
     }
+    // After a system sleep IOFramebuffer leaves pagingState false (systemWork, kIOFBNotifyWillSleep) until the driver
+    // reports the wake from the controller's power thread. This driver acknowledges power changes itself and never
+    // gets onto that thread (handleEvent is a no-op anywhere else), so after a wake from hibernation every user-client
+    // call waited in _extEntry for good: WindowServer sat in displayDidWake -> IOFBGetCurrentDisplayModeAndDepth until
+    // the watchdog panicked the Mac. debug.phxfb_wake=1 (written once the GPU has been brought up again) opens the
+    // gate: pagingState back on and the sleepers on fServerConnect woken, under the controller's work loop.
+    static IOReturn wakeGated(OSObject *o, void *, void *, void *, void *) {
+        PhxAMDFB *me = static_cast<PhxAMDFB *>(o);
+        me->pagingState = true;
+        struct Gate : IOWorkLoop { static void wake(IOWorkLoop *w, void *e) { static_cast<Gate *>(w)->wakeupGate(e, false); } };
+        if (IOWorkLoop *wl = me->getControllerWorkLoop()) Gate::wake(wl, &me->fServerConnect);
+        return kIOReturnSuccess;
+    }
+    void forceWake() {
+        IOWorkLoop *wl = getControllerWorkLoop();
+        if (wl) wl->runAction(&PhxAMDFB::wakeGated, this); else pagingState = true;
+        deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)true);
+        deliverFramebufferNotification(kIOFBNotifyDidPowerOn, (void *)false);   // the pair IOFBController sends after a power-up
+    }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         trace("attr", attribute, value);
         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
@@ -709,6 +728,7 @@ bool PhxAMDFB::start(IOService *provider)
         { 1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
     registerPowerDriver(this, states, 2);
+    { extern void phxFbWakeInstall(void *); phxFbWakeInstall(this); }
     phxHoldInit(this, kBootHoldSec);
     phxAgdcInstall();
     if (!gAliasSysctl) { for (auto *o : kFbOids) sysctl_register_oid(o); gAliasSysctl = true; }
@@ -717,9 +737,24 @@ bool PhxAMDFB::start(IOService *provider)
     return true;
 }
 
+static PhxAMDFB *gFbSelf;
+static int gFbWakes;
+static int sysctl_fbwake SYSCTL_HANDLER_ARGS {
+    int v = gFbWakes;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v && gFbSelf) { gFbSelf->forceWake(); gFbWakes++; IOLog("PhxFB: wake forced (%d)\n", gFbWakes); }
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, phxfb_wake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_fbwake, "I",
+            "write 1 after a system wake, once the GPU is up again: lets WindowServer back into the framebuffer");
+
+void phxFbWakeInstall(void *fb) { if (!gFbSelf) { gFbSelf = static_cast<PhxAMDFB *>(fb); sysctl_register_oid(&sysctl__debug_phxfb_wake); } }
+
 void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
+    if (gFbSelf == this) { gFbSelf = nullptr; sysctl_unregister_oid(&sysctl__debug_phxfb_wake); }
     phxAgdcRemove();
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
     if (gAliasSysctl) { for (auto *o : kFbOids) sysctl_unregister_oid(o); gAliasSysctl = false; }

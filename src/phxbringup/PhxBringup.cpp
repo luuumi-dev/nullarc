@@ -130,6 +130,11 @@ private:
 
     const phx_topology *topology{nullptr};
     bool isSleeping{false};
+    // From system sleep until the queues are adopted again after the wake: submissions wait, the retired sequence is
+    // frozen at what the GPU had finished before the power went.
+    volatile bool suspended{false};
+    uint64_t retiredAtSleep{0};
+    char resumeEvent{0};   // what gpuSubmit() sleeps on
     IOPCIDevice *pci{nullptr};
     IOMemoryMap *mmio{nullptr};
     IOLock *smuLock{nullptr};
@@ -428,11 +433,25 @@ void PhxBringup::stop(IOService *provider) {
 
 IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice) {
     if (ordinal == 0) {
-        IOLog("PhxBringup: powerStateWillChange to sleep (state 0)\n");
+        // The GPU loses power in a system sleep (S4 here: no S3 on Phoenix laptops) and comes back in its power-on
+        // state; the bring-up then runs again from user space and adopts the queues once more. Until that has happened
+        // nothing may reach the hardware: a submission into the dead ring made its client wait out the ring-space
+        // timeout and fail (loginwindow died in RenderBox one second after a wake, and WindowServer closed with it).
+        // Let the GPU finish what it has, then hold new submissions in gpuSubmit().
         isSleeping = true;
+        if (gpuLock && gpuReady()) {
+            for (int i = 0; i < 2000 && gpuRetired() < gSeq; i++)
+                IOSleep(1);
+            IOLockLock(gpuLock);
+            retiredAtSleep = gpuRetired();
+            suspended = true;
+            IOLockUnlock(gpuLock);
+            IOLog("PhxBringup: sleep: submissions held at seq %llu (emitted %llu)\n",
+                  static_cast<unsigned long long>(retiredAtSleep), static_cast<unsigned long long>(gSeq));
+        }
     } else {
-        IOLog("PhxBringup: powerStateDidChange from sleep (state 1)\n");
         isSleeping = false;
+        IOLog("PhxBringup: wake: %s\n", suspended ? "waiting for the bring-up to adopt the queues again" : "nothing held");
     }
     return IOPMAckImplied;
 }
@@ -749,6 +768,18 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
     IOLockLock(gpuLock);
     GpuQueue &q = gq[qi];
     bzero(&q, sizeof(q));
+    // A queue is adopted at boot and again after a wake from hibernation, when the GPU has been through a power cycle
+    // and the bring-up ran a second time. The page tables of every client context are system memory and came back with
+    // the hibernation image, but the page-table base registers of the hardware VMIDs did not: forget the bindings, so
+    // the next submission of each context programs its VMID again (vmBind) instead of running on an unmapped one.
+    if (qi == 0) {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < kMaxCtx; i++)
+            if (vm[i].hw) { vm[i].hw = 0; n++; }
+        for (uint32_t i = 0; i < kNumUserVmids; i++) { hwv[i].ctx = 0; hwv[i].lastSeq = 0; }
+        if (n)
+            IOLog("PhxBringup: re-adoption: %u VMID binding(s) dropped\n", n);
+    }
     q.gfx = qi == 1;
     q.ringOff = static_cast<uint32_t>(ringOff);
     q.ringDw = static_cast<uint32_t>(ringDw);
@@ -761,6 +792,11 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
     fence[1] = static_cast<uint32_t>(gSeq >> 32);
     hdpFlush();
     q.ready = true;
+    if (qi == 1 && suspended) {   // the gfx queue is adopted last: the GPU is whole again
+        suspended = false;
+        IOLockWakeup(gpuLock, &resumeEvent, false);
+        IOLog("PhxBringup: resume: submissions released\n");
+    }
     IOLockUnlock(gpuLock);
     IOLog("PhxBringup: adopted %s queue ring=+0x%llx (%llu dw) wptr=%llu doorbell=+0x%llx\n",
           qi ? "gfx" : "compute", ringOff, ringDw, wptr, dbByte);
@@ -832,6 +868,8 @@ uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
 // Everything up to the returned sequence has finished: the oldest submission still running on any queue, minus one.
 // Lock-free reader: an entry is written before `tail` moves past it.
 uint64_t PhxBringup::gpuRetired() const {
+    if (suspended)
+        return retiredAtSleep;   // the fences are in VRAM, which is gone until the queues are adopted again
     uint64_t r = gSeq;
     for (const GpuQueue &q : gq) {
         if (!q.ready)
@@ -850,6 +888,12 @@ uint64_t PhxBringup::gpuRetired() const {
 }
 
 IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seqOut) {
+    if (suspended) {   // asleep, or awake with the GPU not brought up again yet
+        IOLockLock(gpuLock);
+        while (suspended)
+            IOLockSleep(gpuLock, &resumeEvent, THREAD_UNINT);
+        IOLockUnlock(gpuLock);
+    }
     // graphics IBs go to the gfx queue and compute IBs to the compute queue; with one of them missing, the other runs both
     GpuQueue *qp = gfx ? (gq[1].ready ? &gq[1] : &gq[0]) : (gq[0].ready ? &gq[0] : &gq[1]);
     if (!qp->ready || !vmCtx(handle))
@@ -938,7 +982,7 @@ void PhxBringup::hangTick(thread_call_param_t self, thread_call_param_t) {
 
 void PhxBringup::hangCheck() {
     const int limitMs = gHangMs;
-    if (limitMs <= 0 || !mmio)
+    if (limitMs <= 0 || !mmio || suspended)
         return;
     uint64_t limit, now = mach_absolute_time();
     nanoseconds_to_absolutetime(static_cast<uint64_t>(limitMs) * 1000000ull, &limit);
