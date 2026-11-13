@@ -79,6 +79,7 @@ struct WriteOp {
     int what;          // 1 enable CPPC, 2 request, 3 boost
     uint64_t value;    // request fields (masked by keep) or boost on/off
     uint64_t keepMask; // request bits to keep from the current value
+    bool ownMax, ownMin; // request: max = this CPU's highest perf, min = its lowest nonlinear perf (CAP1)
 };
 static void writeOne(void *arg) {
     const WriteOp *w = static_cast<const WriteOp *>(arg);
@@ -87,7 +88,17 @@ static void writeOne(void *arg) {
             wrmsr(kMsrCppcEnable, 1);
     } else if (w->what == 2) {
         const uint64_t cur = rdmsr(kMsrCppcReq);
-        wrmsr(kMsrCppcReq, (cur & w->keepMask) | (w->value & ~w->keepMask));
+        uint64_t v = w->value;
+        if (w->ownMax || w->ownMin) {
+            // the cores differ (preferred cores: highest 196..232 on a Ryzen 7 255), so one value for all would cap
+            // the best ones; amd-pstate also writes each CPU's own limits
+            const uint64_t c1 = rdmsr(kMsrCppcCap1);
+            if (w->ownMax)
+                v = (v & ~0xffull) | ((c1 >> 24) & 0xff);
+            if (w->ownMin)
+                v = (v & ~0xff00ull) | (((c1 >> 8) & 0xff) << 8);
+        }
+        wrmsr(kMsrCppcReq, (cur & w->keepMask) | (v & ~w->keepMask));
     } else if (w->what == 3) {
         const uint64_t h = rdmsr(kMsrHwcr);
         wrmsr(kMsrHwcr, w->value ? (h & ~kHwcrCpbDis) : (h | kHwcrCpbDis));
@@ -160,12 +171,19 @@ static int handleApply(struct sysctl_oid *oidp, void *, int, struct sysctl_req *
     const uint64_t c1 = gSnap[0].cap1;
     const int lowest = static_cast<int>(c1 & 0xff), highest = static_cast<int>((c1 >> 24) & 0xff);
     uint64_t val = 0, keep = ~0ull;
-    if (gMax >= 0) {
+    bool ownMax = false, ownMin = false;
+    if (gMax == -2) {
+        ownMax = true;
+        keep &= ~0xffull;
+    } else if (gMax >= 0) {
         if (gMax < lowest || gMax > highest) { IOLockUnlock(gLock); return EINVAL; }
         val |= static_cast<uint64_t>(gMax);
         keep &= ~0xffull;
     }
-    if (gMin >= 0) {
+    if (gMin == -2) {
+        ownMin = true;
+        keep &= ~0xff00ull;
+    } else if (gMin >= 0) {
         if (gMin < lowest || gMin > highest || (gMax >= 0 && gMin > gMax)) { IOLockUnlock(gLock); return EINVAL; }
         val |= static_cast<uint64_t>(gMin) << 8;
         keep &= ~0xff00ull;
@@ -178,11 +196,11 @@ static int handleApply(struct sysctl_oid *oidp, void *, int, struct sysctl_req *
     // desired performance 0: autonomous selection (amd-pstate active / EPP mode)
     val |= 0;
     keep &= ~0xff0000ull;
-    WriteOp w = {2, val, keep};
+    WriteOp w = {2, val, keep, ownMax, ownMin};
     mp_rendezvous_no_intrs(writeOne, &w);
     gApplied = 1;
     IOLockUnlock(gLock);
-    IOLog("PhxCPPC: request max %d min %d epp %d (desired 0) applied\n", gMax, gMin, gEpp);
+    IOLog("PhxCPPC: request max %d min %d epp %d (desired 0) applied (-2: each CPU's own)\n", gMax, gMin, gEpp);
     return 0;
 }
 
@@ -210,8 +228,8 @@ SYSCTL_PROC(_debug, OID_AUTO, phx_cppc_dump, CTLTYPE_STRING | CTLFLAG_RD | CTLFL
 SYSCTL_PROC(_debug, OID_AUTO, phx_cppc_enable, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, handleEnable, "I",
             "write 1: enable CPPC on every CPU (until reset)");
 SYSCTL_INT(_debug, OID_AUTO, phx_cppc_epp, CTLFLAG_RW | CTLFLAG_LOCKED, &gEpp, 0, "EPP 0..255 (-1 keep)");
-SYSCTL_INT(_debug, OID_AUTO, phx_cppc_min, CTLFLAG_RW | CTLFLAG_LOCKED, &gMin, 0, "min perf (-1 keep)");
-SYSCTL_INT(_debug, OID_AUTO, phx_cppc_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gMax, 0, "max perf (-1 keep)");
+SYSCTL_INT(_debug, OID_AUTO, phx_cppc_min, CTLFLAG_RW | CTLFLAG_LOCKED, &gMin, 0, "min perf (-1 keep, -2 each CPU's lowest nonlinear)");
+SYSCTL_INT(_debug, OID_AUTO, phx_cppc_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gMax, 0, "max perf (-1 keep, -2 each CPU's highest)");
 SYSCTL_PROC(_debug, OID_AUTO, phx_cppc_apply, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, handleApply, "I",
             "write 1: write epp/min/max (desired 0) on every CPU");
 SYSCTL_PROC(_debug, OID_AUTO, phx_cppc_boost, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, handleBoost, "I",
