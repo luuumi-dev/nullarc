@@ -86,6 +86,14 @@ static void writeOne(void *arg) {
     if (w->what == 1) {
         if (!(rdmsr(kMsrCppcEnable) & 1))
             wrmsr(kMsrCppcEnable, 1);
+        // The firmware leaves MSR_AMD_CPPC_REQ at 0 while CPPC is off. Enabled like that, max perf 0 pins every core
+        // at its lowest clock (544 MHz on a Ryzen 7 255) until something writes the request: start from this CPU's
+        // own limits (max = highest, min = lowest nonlinear, desired 0), the EPP as it is.
+        const uint64_t req = rdmsr(kMsrCppcReq);
+        if ((req & 0xff) == 0) {
+            const uint64_t c1 = rdmsr(kMsrCppcCap1);
+            wrmsr(kMsrCppcReq, (req & ~0xffffffull) | ((c1 >> 24) & 0xff) | (((c1 >> 8) & 0xff) << 8));
+        }
     } else if (w->what == 2) {
         const uint64_t cur = rdmsr(kMsrCppcReq);
         uint64_t v = w->value;
