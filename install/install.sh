@@ -45,8 +45,8 @@ IOR=$(ioreg -l -w0)
 build=$(grep -m1 '"phx-build"' <<<"$IOR" | grep -oE '[0-9]+$' || true)
 if [ -n "$build" ]; then say "  ✓ PhxBringup.kext is loaded (build $build)"
 else fail "PhxBringup.kext is not loaded: add EFI/OC/Kexts/PhxBringup.kext to OpenCore and reboot first"; fi
-if grep -qE '"compatible" = <[^>]*"pci1002,(15bf|15c8|1900|1901)"' <<<"$IOR"; then say "  ✓ Radeon 780M/760M found"
-else say "  ! no Radeon 780M/760M (1002:15bf/15c8/1900/1901) found: other GPUs are not supported"; fi
+if grep -qE '"compatible" = <[^>]*"pci1002,(15bf|15c8|1900|164e)"' <<<"$IOR"; then say "  ✓ Radeon 780M/760M/740M found"
+else say "  ! no Radeon 780M/760M/740M (1002:15bf/15c8/1900/164e) found: other GPUs are not supported"; fi
 for f in EFI/OC/Kexts/PhxBringup.kext Library/Extensions/PhxAccel.kext PhxGPU/NVMTLDriver.bundle PhxGPU/nvmtl/libvulkan_radeon.dylib \
          gpu/phxboot.sh gpu/full.sh gpu/bringup5.sh gpu/kinst.sh gpu/phxctl/phxctl gpu/phxctl/mesboot gpu/local.phxboot.plist; do
     [ -e "$SRC/$f" ] || fail "package file $f is missing"
@@ -95,6 +95,8 @@ printf '# phxboot: Metal for the built-in test tools only\n' > "$L/nvmtl-allow.t
 
 say "== LaunchDaemon local.phxboot"
 install -m 644 -o root -g wheel "$SRC/gpu/local.phxboot.plist" /Library/LaunchDaemons/local.phxboot.plist
+# launchd remembers a disabled service even when its plist is replaced.
+launchctl enable system/local.phxboot
 
 if [ $WS = 1 ]; then
     touch "$G/phxboot-m2"

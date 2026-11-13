@@ -23,6 +23,8 @@ EFI=$(diskutil info "$ESP" | awk -F': *' '/Mount Point/ {print $2}')
 ditto "$EFI/EFI/OC/Kexts/PhxBringup.kext" "$P/EFI/OC/Kexts/PhxBringup.kext"
 cp "$R/hardware/Sample.plist" "$R/hardware/REQUIRED_KEXTS.md" "$P/EFI/OC/"
 ditto /Library/Extensions/PhxAccel.kext "$P/Library/Extensions/PhxAccel.kext"
+# Installed bundles may predate the supported PCI IDs (GitHub #3 / #4).
+python3 "$R/tools/release/check_pci_matches.py" "$R" "$P"
 
 # the plugin as it runs, without what only NVIDIA GPUs use
 ditto "$H/NVMTLDriver.bundle" "$P/PhxGPU/NVMTLDriver.bundle"

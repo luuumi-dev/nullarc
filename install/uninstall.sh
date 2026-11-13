@@ -18,10 +18,10 @@ rm -rf "$H"
 
 echo "== PhxAccel.kext"
 rm -rf /Library/Extensions/PhxAccel.kext
-# rebuild the Auxiliary kernel collection from what is left in /Library/Extensions; with nothing left, drop it
+# Rebuild from remaining extensions; a failed rebuild must not delete their working collection.
 if ! { [ -x "$G/kinst.sh" ] && BK=/var/tmp "$G/kinst.sh"; }; then
-    rm -f /Library/KernelCollections/AuxiliaryKernelExtensions.kc
-    echo "  no Auxiliary kernel collection to rebuild: removed it"
+    echo "  rebuild failed: kept the existing Auxiliary kernel collection and $G for recovery" >&2
+    exit 1
 fi
 
 rm -rf "$G"

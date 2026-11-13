@@ -38,6 +38,8 @@ $(TEST_BIN_DIR)/test_r3n_abi: src/uapi/r3n_user_client.cpp src/winsys/radv_r3n_w
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
 
 test: $(TESTS)
+	python3 tests/test_install_safety.py
+	python3 tests/test_release_pci_matches.py
 	@echo "=== Running RDNA 3 Driver Unit Tests ==="
 	@for t in $(TESTS); do \
 		echo "Running $$t..."; \
