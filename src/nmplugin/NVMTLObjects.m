@@ -2700,7 +2700,7 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void)
 @end
 static void nvmtl_counter_recording_failed(NVMTLCommandBuffer *cb)
 {
-    cb->_c.counter_error = 1;
+    cb->_c.encoding_error = 1;
     [cb nvmtlRecordEncodingError:[NSError errorWithDomain:MTLCommandBufferErrorDomain
         code:MTLCommandBufferErrorInternal userInfo:@{NSLocalizedDescriptionKey:@"Counter recording failed"}]];
 }

@@ -4828,7 +4828,7 @@ static void nvmtl_clear_colour(VkClearColorValue *cv, uint32_t fmt, const float 
 }
 
 static void nvmtl_private_depth_layout(nvk_cmdbuf *, nvk_image *, VkImageLayout);
-int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
+static int nvmtl_vk_cmd_begin_pass_impl(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
 {
     if (!p->rp || !ps->w || !ps->h) { nvlog("begin_render: apps2 no render pass or a %ux%u pass — pass REFUSED", ps->w, ps->h); return -1; }
     nvmtl_sample_pattern pattern = ps->sample_pattern;
@@ -5025,6 +5025,12 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     VkViewport vp = { 0, (float)ps->h, (float)ps->w, -(float)ps->h, 0, 1 }; VkRect2D sc = { { 0, 0 }, { ps->w, ps->h } };
     pvkCmdSetViewport(c->cb, 0, 1, &vp); pvkCmdSetScissor(c->cb, 0, 1, &sc);
     return 0;
+}
+int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
+{
+    int result = nvmtl_vk_cmd_begin_pass_impl(c, ps, p);
+    if (result) c->encoding_error = 1;
+    return result;
 }
 int nvmtl_vk_cmd_begin_render_ms(nvk_cmdbuf *c, nvk_image *img, nvk_pipeline *p, const float clear[4], uint32_t load, nvk_image *resolve)
 {
@@ -5783,7 +5789,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     memset(f, 0, sizeof *f); f->c = c;
     uint64_t *const pt = f->pt;
     if (g_state != 1 || !c || !c->cb) return -2;
-    if (c->counter_error || nvmtl_counter_flush(c)) { nvmtl_cmd_retire(c); return -1; }
+    if (c->encoding_error || nvmtl_counter_flush(c)) { nvmtl_cmd_retire(c); return -1; }
     VkCommandBuffer counter_reset = VK_NULL_HANDLE;
     if (nvmtl_counter_reset_finish(c, &counter_reset)) { nvmtl_cmd_retire(c); return -1; }
     c->timing.clock = nvmtl_clock_snapshot();
@@ -7084,7 +7090,7 @@ typedef struct {
     unsigned reset_ended;
 } nvmtl_counter_recording;
 
-static int nvmtl_counter_fail(nvk_cmdbuf *c) { if (c) c->counter_error = 1; return -1; }
+static int nvmtl_counter_fail(nvk_cmdbuf *c) { if (c) c->encoding_error = 1; return -1; }
 static void nvmtl_counter_memory_barrier(nvk_cmdbuf *c)
 {
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL,
@@ -7095,7 +7101,7 @@ static void nvmtl_counter_memory_barrier(nvk_cmdbuf *c)
 }
 static int nvmtl_counter_flush(nvk_cmdbuf *c)
 {
-    if (!c || c->counter_error) return -1;
+    if (!c || c->encoding_error) return -1;
     nvmtl_counter_recording *r = c->counter_recording;
     if (!r || !r->count) return 0;
     if (c->in_rp) return nvmtl_counter_fail(c);
@@ -7154,7 +7160,7 @@ void nvmtl_vk_ts_pool_destroy(void *pool)
 int nvmtl_vk_cmd_ts_write(nvk_cmdbuf *c, void *pool, uint32_t idx, int barrier)
 {
     nvmtl_counter_state *s = pool;
-    if (!c || !c->cb || !s || idx >= s->count || c->counter_error) return nvmtl_counter_fail(c);
+    if (!c || !c->cb || !s || idx >= s->count || c->encoding_error) return nvmtl_counter_fail(c);
     nvmtl_counter_recording *r = c->counter_recording;
     if (!r) {
         r = calloc(1, sizeof *r);

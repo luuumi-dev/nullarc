@@ -76,7 +76,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *occlusion_pages; uint32_t occlusion_count;
                  void *timing_pool; nvmtl_gpu_interval timing;
                  void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4];
-                 void *counter_recording; unsigned counter_error;
+                 void *counter_recording; unsigned encoding_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
                  unsigned restart_off;  /* GL turned primitive restart off (setPrimitiveRestartEnabled:NO) */
