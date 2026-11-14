@@ -82,6 +82,8 @@ static bool vaCanonical(uint64_t va) {
     return top == 0 || top == 0x1FFFF;
 }
 
+class IOAccelPhxNativeClient;
+
 class PhxBringup : public IOService {
     OSDeclareDefaultStructors(PhxBringup)
 public:
@@ -112,7 +114,8 @@ public:
     bool gpuReady() const { return gq[0].ready || gq[1].ready; }
     // one GPUVM context (VMID 8..15) per client process: RADV instances allocate VAs independently
     uint32_t vmidAlloc();
-    void vmidFree(uint32_t vmid, uint64_t lastSeq);
+    bool vmidFree(uint32_t vmid, uint64_t lastSeq);
+    void deferClient(IOAccelPhxNativeClient *client);
     IOReturn vmMap(uint32_t vmid, uint64_t va, IOMemoryDescriptor *md, uint64_t off, uint64_t size);
     IOReturn vmUnmap(uint32_t vmid, uint64_t va, uint64_t size);
     IOReturn gpuSubmit(uint32_t vmid, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seq);
@@ -201,6 +204,8 @@ private:
     volatile bool hangStop{false};
     static void hangTick(thread_call_param_t self, thread_call_param_t);
     void hangCheck();
+    void reapClients();
+    IOAccelPhxNativeClient *retiringClients{nullptr};
     void killWaves(uint32_t vmid, bool all);
     bool debug{false};
     bool smuUsed{false};
@@ -221,6 +226,10 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
 
 private:
+    friend class PhxBringup;
+    IOAccelPhxNativeClient *retiringNext{nullptr};
+    bool closing{false};
+    bool releaseResources();
     struct Bo {
         IOMemoryDescriptor *md;   // an IOBufferMemoryDescriptor, or the caller's own pages (host, prepared)
         uint64_t size;
@@ -707,14 +716,17 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     return vmid;
 }
 
-// Returns a context once the GPU is past the client's last submission (bounded wait): the tables used so far are
-// cleared, so nothing the client mapped stays reachable, and its hardware VMID (if any) is freed.
-void PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
-    if (!vmCtx(handle))
-        return;
-    for (int i = 0; i < 2000 && gpuRetired() < lastSeq; i++)
-        IOSleep(1);
+// A timeout never licenses teardown: callers retain all resources until this succeeds.
+bool PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
     IOLockLock(gpuLock);
+    if (gpuRetiredLocked() < lastSeq) {
+        IOLockUnlock(gpuLock);
+        return false;
+    }
+    if (!vmCtx(handle)) {
+        IOLockUnlock(gpuLock);
+        return true;
+    }
     VmCtx &c = vm[handle - 1];
     for (uint32_t k = 0; k < kPtChunks && c.chunk[k] && k * kPtChunkPages < c.used; k++) {
         const uint32_t n = c.used - k * kPtChunkPages < kPtChunkPages ? c.used - k * kPtChunkPages : kPtChunkPages;
@@ -731,10 +743,11 @@ void PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
     c.used = 1;
     c.busy = false;
     IOLockUnlock(gpuLock);
+    return true;
 }
 
 IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
-    if (!fbAper || !doorbellMap || !mmio || !fbMcBase || !gpuLock)
+    if (!fbAper || !doorbellMap || !mmio || !fbMcBase || !gpuLock || !hangCall)
         return kIOReturnNotReady;
     // in[5] = fence offset | queue index (0 compute, 1 gfx): the fence is 8-byte aligned, so bit 0 is free
     const uint64_t ringOff = in[0], ringDw = in[1], wbOff = in[2], dbByte = in[3], wptr = in[4], fenceOff = in[5] & ~1ull;
@@ -745,6 +758,11 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
         return kIOReturnBadArgument;
     IOLockLock(gpuLock);
     GpuQueue &q = gq[qi];
+    uint32_t oldest;
+    if (q.ready && phxQueueOldest(q, queueFence(q), oldest)) {
+        IOLockUnlock(gpuLock);
+        return kIOReturnBusy;
+    }
     bzero(&q, sizeof(q));
     q.gfx = qi == 1;
     q.ringOff = static_cast<uint32_t>(ringOff);
@@ -933,6 +951,7 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
 void PhxBringup::hangTick(thread_call_param_t self, thread_call_param_t) {
     PhxBringup *me = static_cast<PhxBringup *>(self);
     me->hangCheck();
+    me->reapClients();
     if (me->hangStop)
         return;
     uint64_t d;
@@ -1355,6 +1374,7 @@ bool IOAccelPhxNativeClient::start(IOService *provider) {
     // E9: several processes at once, each in its own GPUVM context (vmidAlloc); the first one still marks the session
     if (owner->claimSession())
         sessionClaimed = true;
+    owner->retain();
     return IOUserClient::start(provider);
 }
 
@@ -1384,38 +1404,83 @@ void IOAccelPhxNativeClient::freeAll() {
             boRelease(bos[h]);
 }
 
-IOReturn IOAccelPhxNativeClient::clientClose() {
-    if (lock)
-        IOLockLock(lock);
+// The client lock excludes new submissions throughout teardown or retirement handoff.
+bool IOAccelPhxNativeClient::releaseResources() {
+    if (vmid && owner && !owner->vmidFree(vmid, lastSeq))
+        return false;
+    vmid = 0;
     freeAll();
-    if (lock)
-        IOLockUnlock(lock);
-    if (vmid && owner) {
-        owner->vmidFree(vmid, lastSeq);
-        vmid = 0;
-    }
     if (sessionClaimed && owner) {
         owner->releaseSession();
         sessionClaimed = false;
     }
+    return true;
+}
+
+void PhxBringup::deferClient(IOAccelPhxNativeClient *client) {
+    client->retain();
+    IOLockLock(gpuLock);
+    client->retiringNext = retiringClients;
+    retiringClients = client;
+    IOLockUnlock(gpuLock);
+}
+
+void PhxBringup::reapClients() {
+    if (!gpuLock)
+        return;
+    IOAccelPhxNativeClient *ready = nullptr;
+    IOLockLock(gpuLock);
+    const uint64_t retired = gpuRetiredLocked();
+    IOAccelPhxNativeClient **link = &retiringClients;
+    while (*link) {
+        IOAccelPhxNativeClient *client = *link;
+        if (client->lastSeq > retired) {
+            link = &client->retiringNext;
+            continue;
+        }
+        *link = client->retiringNext;
+        client->retiringNext = ready;
+        ready = client;
+    }
+    IOLockUnlock(gpuLock);
+    // Never acquire a client lock while holding gpuLock (submit takes them in the opposite order).
+    while (ready) {
+        IOAccelPhxNativeClient *client = ready;
+        ready = client->retiringNext;
+        IOLockLock(client->lock);
+        const bool released = client->releaseResources();
+        IOLockUnlock(client->lock);
+        if (!released)
+            deferClient(client);
+        client->release();
+    }
+}
+
+IOReturn IOAccelPhxNativeClient::clientClose() {
+    IOLockLock(lock);
+    if (!closing) {
+        closing = true;
+        if (!releaseResources())
+            owner->deferClient(this);
+    }
+    IOLockUnlock(lock);
     terminate();
     return kIOReturnSuccess;
 }
 
 void IOAccelPhxNativeClient::free() {
-    if (vmid && owner) {
-        owner->vmidFree(vmid, lastSeq);
-        vmid = 0;
-    }
-    freeAll();
-    if (sessionClaimed && owner)
-        owner->releaseSession();
+    // clientClose/clientDied retains an unfinished client in the provider's retirement list.
+    // Failed initialization has no submissions and can be released immediately.
+    if (!releaseResources())
+        IOLog("PhxBringup: unexpected free of unfinished client; keeping its GPU resources pinned\n");
     if (bos)
         IOFree(bos, sizeof(Bo) * PHXN_MAX_BOS);
     if (maps)
         IOFree(maps, sizeof(Map) * kMaxMaps);
     if (lock)
         IOLockFree(lock);
+    if (owner)
+        owner->release();
     IOUserClient::free();
 }
 
@@ -1427,6 +1492,10 @@ IOAccelPhxNativeClient::Bo *IOAccelPhxNativeClient::findBo(uint32_t h) {
 
 IOReturn IOAccelPhxNativeClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) {
     IOLockLock(lock);
+    if (closing) {
+        IOLockUnlock(lock);
+        return kIOReturnNotOpen;
+    }
     Bo *b = findBo(type);
     if (!b) {
         IOLockUnlock(lock);
@@ -1456,7 +1525,9 @@ IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMet
 
     IOLockLock(lock);
     IOReturn r;
-    if (selector != PHXN_SEL_HELLO && !hello) {
+    if (closing) {
+        r = kIOReturnNotOpen;
+    } else if (selector != PHXN_SEL_HELLO && !hello) {
         r = kIOReturnNotReady;
     } else {
         switch (selector) {
@@ -2206,6 +2277,10 @@ IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {
     if (!shape(a, 3, 3, 0, 0))
         return kIOReturnBadArgument;
     IOLockLock(lock);
+    if (closing) {
+        IOLockUnlock(lock);
+        return kIOReturnNotOpen;
+    }
     uint64_t target = a->scalarInput[0];
     const uint64_t em = emitted;
     IOLockUnlock(lock);
