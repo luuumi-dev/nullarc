@@ -11,6 +11,8 @@
 #include <IOKit/IONVRAM.h>
 #include <IOKit/IOMessage.h>
 #include <sys/sysctl.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
+#include <kern/thread_call.h>
 
 struct PolicyVars {            // IOPMSystemSleepPolicyVariables (xnu IOPMPrivate.h)
     uint32_t signature, version; uint64_t currentCapability, highestCapability, sleepFactors;
@@ -78,6 +80,40 @@ static void copyKey(void) {
     if (o) o->release();
 }
 
+// After a hibernation the embedded controller has been through a power cycle and is back in its non-ACPI mode: it no
+// longer raises its queries, so closing the lid does nothing and the brightness keys are dead (on a MECHREVO WUJIE15XA), while
+// keys the keyboard controller reports itself (volume, keyboard backlight) still work. The firmware tells the EC which
+// OS runs in EC0._REG (XSEC = OSEC) and again in _WAK, but there only for Arg0 == 4, which macOS does not pass on this
+// path. Running the EC's _REG(3, 1) again after every wake puts the EC back into ACPI mode.
+static int gEcReg = 0, gEcRegLast = -1;
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_ecreg, CTLFLAG_RD, &gEcReg, 0, "EC0._REG evaluations after a wake");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_ecreg_last, CTLFLAG_RD, &gEcRegLast, 0, "result of the last one (0 = ok)");
+static void ecRegister(thread_call_param_t, thread_call_param_t) {
+    // the EC by its _HID, as AppleACPIEC finds it
+    OSDictionary *m = IOService::nameMatching("PNP0C09");
+    IOService *svc = m ? IOService::copyMatchingService(m) : nullptr;
+    if (m) m->release();
+    if (svc && svc->metaCast("IOACPIPlatformDevice")) {
+        IOACPIPlatformDevice *ec = static_cast<IOACPIPlatformDevice *>(svc);
+        OSObject *args[2] = { OSNumber::withNumber(3ull, 32), OSNumber::withNumber(1ull, 32) };   // EmbeddedControl, connect
+        gEcRegLast = (args[0] && args[1]) ? ec->evaluateObject("_REG", nullptr, args, 2) : -2;
+        if (args[0]) args[0]->release();
+        if (args[1]) args[1]->release();
+        gEcReg++;
+        IOLog("PhxSleepPolicy: %s._REG(3, 1) -> 0x%x\n", ec->getName(), gEcRegLast);
+    } else IOLog("PhxSleepPolicy: no embedded controller (PNP0C09) found, nothing re-registered\n");
+    if (svc) svc->release();
+}
+// debug.phxsleep_ecreg_now: write 1 to run it by hand
+static int ecRegNow(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+    int v = 0; int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v == 1) ecRegister(nullptr, nullptr);
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, phxsleep_ecreg_now, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ecRegNow, "I", "write 1: evaluate the EC's _REG(3, 1) now");
+static thread_call_t gEcCall;
+
 class PhxSleepPolicy : public IOService {
     OSDeclareDefaultStructors(PhxSleepPolicy)
 public:
@@ -98,6 +134,8 @@ bool PhxSleepPolicy::start(IOService *provider) {
     gInstalled = r == kIOReturnSuccess ? 1 : -1;
     IOLog("PhxSleepPolicy: install -> 0x%x (%s)\n", r, r == kIOReturnSuccess ? "ours" : "another handler was first");
     sysctl_register_oid(&sysctl__debug_phxsleep_key_writes);
+    sysctl_register_oid(&sysctl__debug_phxsleep_ecreg); sysctl_register_oid(&sysctl__debug_phxsleep_ecreg_last); sysctl_register_oid(&sysctl__debug_phxsleep_ecreg_now);
+    gEcCall = thread_call_allocate(ecRegister, nullptr);
     static IOPMPowerState states[2] = {
         { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 } };
@@ -107,6 +145,11 @@ bool PhxSleepPolicy::start(IOService *provider) {
 }
 
 IOReturn PhxSleepPolicy::setPowerState(unsigned long ordinal, IOService *) {
-    if (ordinal == 0) copyKey();
+    static bool slept = false;   // not at the initial power-on, where the EC driver registers the region itself
+    if (ordinal == 0) { slept = true; copyKey(); }
+    else if (gEcCall && slept) {   // two seconds after power-on: the ACPI EC driver is awake by then
+        uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d);
+        thread_call_enter_delayed(gEcCall, d);
+    }
     return kIOPMAckImplied;
 }
