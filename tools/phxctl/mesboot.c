@@ -544,8 +544,26 @@ static void vm8_test(void)
    grbm_select(0, 0, 0, 0);
 }
 
+// SDMA0 is loaded by the PSP but stays halted (SDMA0_F32_CNTL.HALT), as nothing here uses it. The RLC, though, asks
+// every engine before it gates the GFX clocks (coarse grain clock gating), and a halted SDMA never answers: its
+// SDMA0_STATUS_REG.CGCG_FENCE stays 0, RLC_RLCS_CGCG_REQUEST stays at 3 and RLC_RLCS_CGCG_STATUS at 0x24 (both GFX
+// clocks running) for good, whatever the CGCG registers say. Linux (sdma_v6_0_gfx_resume) clears the halt and sets
+// SDMA0_CNTL bit 28 at init; with only that, and no ring, the firmware idles and answers: on a Ryzen 7 8745HS the idle
+// package power went from 6.5 W to 5.8 W, and RLC_GPM_STAT from 0x00140016 to Linux's 0x000c001a.
+// Opt-in for now, MESBOOT_SDMA=1: on an ACEMAGIC RX16 (Ryzen 7 255) the machine reset three times within 45 minutes
+// with SDMA running and never with it halted, cause unknown; the WUJIE15XA ran 13 hours without one.
+static void sdma_unhalt(void)
+{
+   if (!env_on("MESBOOT_SDMA")) return;
+   wr(SEG1(0x589a), rd(SEG1(0x589a)) & ~1u);            // SDMA0_F32_CNTL.HALT
+   wr(SEG0(0x001c), rd(SEG0(0x001c)) | (1u << 28));     // SDMA0_CNTL, as Linux leaves it (0x10002440)
+   wr(SEG0(0x005c), rd(SEG0(0x005c)) | 2u);             // SDMA0_RLC_CGCG_CTRL.CGCG_INT_ENABLE
+   printf("sdma0: f32_cntl=0x%08x status=0x%08x (CGCG_FENCE %u)\n", rd(SEG1(0x589a)), rd(SEG0(0x0025)), (rd(SEG0(0x0025)) >> 11) & 1);
+}
+
 static void sched_test(void)
 {
+   sdma_unhalt();
    sched_init();
    union MESAPI_SET_HW_RESOURCES r;
    memset(&r, 0, sizeof(r));
