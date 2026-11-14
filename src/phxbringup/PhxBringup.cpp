@@ -23,6 +23,7 @@
 #include <kern/clock.h>
 
 #include "PhxNativeABI.h"
+#include "PhxGpuQueue.h"
 
 #define PHX_KEXT_BUILD 34u
 
@@ -158,19 +159,11 @@ private:
     // page-table pool (physically contiguous system memory; page 0 is the root). Sequence numbers are global across
     // the queues; each queue's fence holds the last sequence it finished, and fseq/fend keep its outstanding
     // submissions in order (sequence, ring position after it).
-    struct GpuQueue {
-        bool ready, gfx;
-        uint32_t ringOff, ringDw, wbOff, fenceOff;
-        uint64_t dbByte, wptr, doneEnd;
-        uint64_t fseq[64], fend[64];
-        uint32_t fvmid[64];                     // the hardware VMID each outstanding submission runs under
-        volatile uint32_t head, tail;
-        uint64_t lastDone, lastProgress;        // the hang watchdog's view: fence seen last, and when it last moved
-        uint64_t killedSeq; bool killedAll;
-    };
+    using GpuQueue = PhxGpuQueue;
     GpuQueue gq[2]{};
     uint64_t gSeq{0};
     uint64_t queueFence(const GpuQueue &q) const;
+    uint64_t gpuRetiredLocked() const;          // caller holds gpuLock (including vmBind)
     IOLock *gpuLock{nullptr};
     // One GPUVM context (page tables) per client, and the eight hardware VMIDs lent to contexts at submission time,
     // as amdgpu does: a fixed VMID per client capped Metal at eight processes, and with every app allowed Metal the
@@ -192,6 +185,7 @@ private:
     struct HwVmid {
         uint32_t ctx;                     // handle of the context it points at, 0 = free
         uint64_t lastSeq, lastUse;        // its newest submission; when it was last bound or used
+        uint64_t binding;                 // survives free/rebind, even to the same context handle
     };
     HwVmid hwv[8]{};
     uint64_t hwTick{0};
@@ -673,7 +667,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     }
     int pick = -1;
     for (int spin = 0; pick < 0; spin++) {
-        const uint64_t done = gpuRetired();
+        const uint64_t done = gpuRetiredLocked();
         uint64_t oldest = ~0ull;
         for (uint32_t i = 0; i < kNumUserVmids; i++) {
             if (!hwv[i].ctx) {
@@ -695,6 +689,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     if (h.ctx)
         vm[h.ctx - 1].hw = 0;
     h.ctx = handle;
+    h.binding++;
     h.lastSeq = 0;
     h.lastUse = now;
     const uint32_t vmid = kFirstUserVmid + static_cast<uint32_t>(pick);
@@ -830,35 +825,42 @@ uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
 }
 
 // Everything up to the returned sequence has finished: the oldest submission still running on any queue, minus one.
-// Lock-free reader: an entry is written before `tail` moves past it.
 uint64_t PhxBringup::gpuRetired() const {
+    IOLockLock(gpuLock);
+    const uint64_t r = gpuRetiredLocked();
+    IOLockUnlock(gpuLock);
+    return r;
+}
+
+uint64_t PhxBringup::gpuRetiredLocked() const {
     uint64_t r = gSeq;
     for (const GpuQueue &q : gq) {
         if (!q.ready)
             continue;
         const uint64_t done = queueFence(q);
-        const uint32_t tail = q.tail;
-        for (uint32_t i = q.head; i != tail; i++) {
-            if (q.fseq[i & 63] > done) {
-                if (q.fseq[i & 63] - 1 < r)
-                    r = q.fseq[i & 63] - 1;
-                break;
-            }
-        }
+        uint32_t oldest;
+        if (phxQueueOldest(q, done, oldest) && q.fseq[oldest] - 1 < r)
+            r = q.fseq[oldest] - 1;
     }
     return r;
 }
 
 IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seqOut) {
+    if (!gpuLock)
+        return kIOReturnNotReady;
+    IOLockLock(gpuLock);
     // graphics IBs go to the gfx queue and compute IBs to the compute queue; with one of them missing, the other runs both
     GpuQueue *qp = gfx ? (gq[1].ready ? &gq[1] : &gq[0]) : (gq[0].ready ? &gq[0] : &gq[1]);
-    if (!qp->ready || !vmCtx(handle))
+    if (!qp->ready || !vmCtx(handle)) {
+        IOLockUnlock(gpuLock);
         return kIOReturnNotReady;
+    }
     GpuQueue &q = *qp;
     const uint32_t need = n * 4 + 8;
-    if (need + 16 > q.ringDw)
+    if (need + 16 > q.ringDw) {
+        IOLockUnlock(gpuLock);
         return kIOReturnBadArgument;
-    IOLockLock(gpuLock);
+    }
     // Ring space and the 64-entry history: retire finished entries, wait for the oldest one if needed (bounded, ~2 s).
     for (int spin = 0;; spin++) {
         const uint64_t done = queueFence(q);
@@ -905,7 +907,7 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     q.fseq[q.tail & 63] = seq;
     q.fend[q.tail & 63] = q.wptr;
     q.fvmid[q.tail & 63] = vmid;
-    __asm__ __volatile__("" ::: "memory");
+    q.fbinding[q.tail & 63] = hwv[vmid - kFirstUserVmid].binding;
     q.tail = q.tail + 1;
     // BAR0 is write-combined: drain the WC buffers so the packets are in VRAM before the CP is told about them
     __asm__ __volatile__("sfence" ::: "memory");
@@ -938,43 +940,43 @@ void PhxBringup::hangTick(thread_call_param_t self, thread_call_param_t) {
 
 void PhxBringup::hangCheck() {
     const int limitMs = gHangMs;
-    if (limitMs <= 0 || !mmio)
+    if (limitMs <= 0 || !mmio || !gpuLock)
         return;
-    uint64_t limit, now = mach_absolute_time();
+    uint64_t limit;
     nanoseconds_to_absolutetime(static_cast<uint64_t>(limitMs) * 1000000ull, &limit);
+    IOLockLock(gpuLock);
+    const uint64_t now = mach_absolute_time();
     for (GpuQueue &q : gq) {
         if (!q.ready)
             continue;
         const uint64_t done = queueFence(q);
-        const uint32_t tail = q.tail;
         uint32_t oldest = 0;
-        bool found = false;
-        for (uint32_t i = q.head; i != tail && !found; i++)
-            if (q.fseq[i & 63] > done) {
-                oldest = i & 63;
-                found = true;
-            }
-        if (!found || done != q.lastDone) {   // idle, or moving: the clock restarts
-            q.lastDone = done;
-            q.lastProgress = now;
+        const PhxHangAction action = phxQueueHangAction(q, done, now, limit, oldest);
+        if (action == PhxHangAction::None)
             continue;
-        }
-        if (now - q.lastProgress < limit)
+        const uint32_t vmid = q.fvmid[oldest];
+        if (vmid < kFirstUserVmid || vmid >= kFirstUserVmid + kNumUserVmids)
             continue;
-        if (q.killedSeq != q.fseq[oldest]) {
-            killWaves(q.fvmid[oldest], false);
+        const HwVmid &h = hwv[vmid - kFirstUserVmid];
+        // The GPU can finish during the check; VMID ownership cannot change until after killWaves.
+        if (!phxQueueKillValid(q, oldest, queueFence(q), h.ctx, h.binding) ||
+            h.ctx > kMaxCtx || !vm[h.ctx - 1].busy || vm[h.ctx - 1].hw != vmid)
+            continue;
+        if (action == PhxHangAction::Vmid) {
+            killWaves(vmid, false);
             q.killedSeq = q.fseq[oldest];
             q.killedAll = false;
             q.lastProgress = now;
             IOLog("PhxBringup: %s queue stuck %d ms at seq %llu: killed the waves of VMID %u\n", q.gfx ? "gfx" : "compute",
                   limitMs, static_cast<unsigned long long>(q.fseq[oldest]), q.fvmid[oldest]);
-        } else if (!q.killedAll && now - q.lastProgress >= limit / 2) {
+        } else {
             killWaves(0, true);
             q.killedAll = true;
             IOLog("PhxBringup: %s queue still stuck at seq %llu: killed every wave\n", q.gfx ? "gfx" : "compute",
                   static_cast<unsigned long long>(q.fseq[oldest]));
         }
     }
+    IOLockUnlock(gpuLock);
 }
 
 // gfx_v11_0_ring_soft_recovery: SQ_CMD kill (CMD 3) broadcast (MODE 1), limited to one VMID unless `all`, inside RLC
