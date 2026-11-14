@@ -1,5 +1,5 @@
 // Verify Metal clears the entire attachment despite a smaller render area.
-// Usage: clearprobe [view]; NULLARC_TEST_PLUGIN=/absolute/path selects an isolated build.
+// Usage: clearprobe [view [0|1]]; NULLARC_TEST_PLUGIN=/absolute/path selects an isolated build.
 // Compile with -fobjc-arc -framework Foundation -framework Metal -framework IOSurface -framework IOKit.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -34,8 +34,9 @@ static id<MTLDevice> testDevice(void) {
 int main(int argc, const char **argv) {
     @autoreleasepool {
         const NSUInteger width = 8, height = 4;
-        const BOOL view = argc == 2 && !strcmp(argv[1], "view");
-        if (argc > 2 || (argc == 2 && !view)) return 2;
+        const BOOL view = argc >= 2 && !strcmp(argv[1], "view");
+        if (argc > 3 || (argc >= 2 && !view) || (argc == 3 && strcmp(argv[2], "0") && strcmp(argv[2], "1"))) return 2;
+        const NSUInteger slot = argc == 3 && !strcmp(argv[2], "1") ? 1 : 0;
         id<MTLDevice> device = testDevice();
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (!device || !queue) { fprintf(stderr, "no Metal device/queue\n"); return 1; }
@@ -60,10 +61,10 @@ int main(int argc, const char **argv) {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         id<MTLTexture> target = view ? [texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB] : texture;
         if (!target) { CFRelease(surface); return 1; }
-        pass.colorAttachments[0].texture = target;
-        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+        pass.colorAttachments[slot].texture = target;
+        pass.colorAttachments[slot].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[slot].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[slot].clearColor = MTLClearColorMake(0.5, 0, 0, 1);
         pass.renderTargetWidth = 4; pass.renderTargetHeight = 2;
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLRenderCommandEncoder> render = [cb renderCommandEncoderWithDescriptor:pass];
@@ -82,7 +83,7 @@ int main(int argc, const char **argv) {
         for (NSUInteger y = 0; y < height; y++) {
             const uint32_t *row = (const uint32_t *)((const uint8_t *)output.contents + y * 256);
             for (NSUInteger x = 0; x < width; x++) {
-                uint32_t wanted = 0xffff0000u;
+                uint32_t wanted = view ? 0xffbc0000u : 0xff800000u;
                 if (row[x] != wanted) {
                     if (bad < 4) printf("pixel %lu,%lu: %08x wanted %08x\n", (unsigned long)x, (unsigned long)y, row[x], wanted);
                     bad++;
