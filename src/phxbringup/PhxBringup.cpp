@@ -24,6 +24,7 @@
 
 #include "PhxNativeABI.h"
 #include "PhxGpuQueue.h"
+#include "PhxPendingFences.h"
 
 #define PHX_KEXT_BUILD 34u
 
@@ -281,8 +282,8 @@ private:
     uint64_t visUsed{0}, hiUsed{0}, gttUsed{0}, hostUsed{0};
     task_t task{nullptr};
     uint64_t emitted{0};
-    uint32_t pendFenceHandle{0}, pendFenceOffset{0};
-    uint64_t pendFenceSeq{0};
+    PhxPendingFences pendingFences;
+    void retireFences(uint64_t retired, bool publish = true);
 };
 
 OSDefineMetaClassAndStructors(IOAccelPhxNativeClient, IOUserClient)
@@ -1356,7 +1357,17 @@ bool IOAccelPhxNativeClient::start(IOService *provider) {
     return IOUserClient::start(provider);
 }
 
+void IOAccelPhxNativeClient::retireFences(uint64_t retired, bool publish) {
+    while (PhxPendingFence *f = pendingFences.take(retired)) {
+        if (publish)
+            bcopy(&f->seq, f->destination, sizeof(f->seq));
+        f->memory->release();
+        IOFree(f, sizeof(*f));
+    }
+}
+
 void IOAccelPhxNativeClient::freeAll() {
+    retireFences(~0ull, false);
     if (maps && vmid && owner) {
         for (int i = 0; i < kMaxMaps; i++) {
             if (maps[i].used) {
@@ -1875,15 +1886,22 @@ IOReturn IOAccelPhxNativeClient::doSubmit(IOExternalMethodArguments *a) {
         bcopy(in + sizeof(h), &ib0, sizeof(ib0));
         if (!ensureVmid())
             return kIOReturnNoResources;
+        retireFences(owner->gpuRetired());
+        PhxPendingFence *pending = fb ? static_cast<PhxPendingFence *>(IOMallocZero(sizeof(PhxPendingFence))) : nullptr;
+        if (fb && !pending)
+            return kIOReturnNoMemory;
         const IOReturn r = owner->gpuSubmit(vmid, ib0.ip_type == PHX_AMDGPU_HW_IP_GFX, va, dw, h.num_ibs, &seq);
-        if (r != kIOReturnSuccess)
+        if (r != kIOReturnSuccess) {
+            if (pending)
+                IOFree(pending, sizeof(*pending));
             return r;
+        }
         lastSeq = seq;
         emitted = seq;   // externalMethod already holds `lock`
         if (fb) {
-            pendFenceHandle = h.fence_handle;
-            pendFenceOffset = h.fence_offset;
-            pendFenceSeq = seq;
+            fb->md->retain();
+            *pending = PhxPendingFence{seq, fb->kva + h.fence_offset, fb->md, nullptr};
+            pendingFences.append(pending);
         }
         a->scalarOutput[0] = seq;
         return kIOReturnSuccess;
@@ -2200,12 +2218,7 @@ IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {
             // client (WindowServer) freed a BO mid-flush and the walk dereferenced its NULL descriptor (panic 2026-10-20)
             IOLockLock(lock);
             flushBos();
-            if (pendFenceSeq && pendFenceSeq <= retired) {
-                Bo *fb = findBo(pendFenceHandle);
-                if (fb && fb->kva && pendFenceOffset + 8 <= fb->size)
-                    bcopy(&pendFenceSeq, fb->kva + pendFenceOffset, 8);
-                pendFenceSeq = 0;
-            }
+            retireFences(retired);
             IOLockUnlock(lock);
         }
         a->scalarOutput[0] = retired < target;
