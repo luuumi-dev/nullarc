@@ -46,6 +46,15 @@ inline ModesetResult modeset(DpmsCtx &c, const phxtiming::Mode &m, const PhxDmlV
         vfp > m.vTotal - m.vActive || m.vSync > m.vTotal - m.vActive - vfp ||
         !buildPlan(io, plan, VTiming{m.vTotal, m.vFrontPorch, m.vActive}).ok)
         return r;
+    // The live stream must survive an absent, unlocated or stopped firmware channel.
+    if (!c.ib || !c.dio.rd || !c.dio.wr || !c.dio.vramRd || !c.dio.vramWr || !c.dio.delayUs ||
+        c.ib->capacity < 2 * phxdmubinbox::kCmdBytes || c.ib->capacity % phxdmubinbox::kCmdBytes ||
+        c.ib->wrpt >= c.ib->capacity || c.ib->rptr >= c.ib->capacity || c.ib->lastWptr >= c.ib->capacity ||
+        c.ib->wrpt % phxdmubinbox::kCmdBytes || c.ib->rptr % phxdmubinbox::kCmdBytes ||
+        c.ib->lastWptr % phxdmubinbox::kCmdBytes || !phxdmubinbox::ready(c.dio)) {
+        c.dmub = phxdmubinbox::Status::NotReady;
+        return r;
+    }
     // down, as the old stream
     dpmsOff(c);
     otgDown(io, r.otg);
