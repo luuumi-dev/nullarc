@@ -12,7 +12,8 @@ TESTS = $(TEST_BIN_DIR)/test_rdna3_discovery_uma \
         $(TEST_BIN_DIR)/test_phx_topology \
         $(TEST_BIN_DIR)/test_wait_seq \
         $(TEST_BIN_DIR)/test_phx_gpu_queue \
-        $(TEST_BIN_DIR)/test_phx_pending_fences
+        $(TEST_BIN_DIR)/test_phx_pending_fences \
+        $(TEST_BIN_DIR)/test_hdmi_modeset_validation
 
 .PHONY: all test clean kext fixtures
 
@@ -20,6 +21,9 @@ all: test
 
 $(TEST_BIN_DIR):
 	mkdir -p $(TEST_BIN_DIR)
+
+$(TEST_BIN_DIR)/test_hdmi_modeset_validation: tests/test_hdmi_modeset_validation.cpp $(wildcard src/amd/phx_*.h) | $(TEST_BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
 
 $(TEST_BIN_DIR)/test_phx_pending_fences: tests/test_phx_pending_fences.cpp src/phxbringup/PhxPendingFences.h | $(TEST_BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@

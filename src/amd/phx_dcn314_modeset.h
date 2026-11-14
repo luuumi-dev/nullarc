@@ -37,6 +37,15 @@ inline unsigned frameWaitUs(const phxtiming::Mode &m) {
 inline ModesetResult modeset(DpmsCtx &c, const phxtiming::Mode &m, const PhxDmlVal *plan, phxdmubcmd::Signal to) {
     ModesetResult r;
     const Io &io = c.io;
+    // Reject an unrepresentable mode or incomplete DML plan before taking the live stream down.
+    const unsigned vfp = m.vFrontPorch ? m.vFrontPorch : 1;
+    if (!plan || !io.rd || !io.wr || !io.delayUs || !m.pixelKhz ||
+        !m.hActive || !m.vActive || m.hTotal > 32768 || m.vTotal > 32768 ||
+        m.hActive >= m.hTotal || m.vActive >= m.vTotal || !m.hSync || !m.vSync ||
+        m.hFrontPorch > m.hTotal - m.hActive || m.hSync > m.hTotal - m.hActive - m.hFrontPorch ||
+        vfp > m.vTotal - m.vActive || m.vSync > m.vTotal - m.vActive - vfp ||
+        !buildPlan(io, plan, VTiming{m.vTotal, m.vFrontPorch, m.vActive}).ok)
+        return r;
     // down, as the old stream
     dpmsOff(c);
     otgDown(io, r.otg);
