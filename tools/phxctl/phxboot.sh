@@ -96,13 +96,18 @@ echo "done $(date '+%T')"
 # same way: the session is logged out and the screen stays black. There is no GPU reset yet, so two WindowServer
 # reports within 5 minutes reboot the Mac; three such reboots within an hour take WindowServer off the GPU.
 watch_hangs() {
-    local base n now first=0
-    base=$(ls $DR | grep -c '^WindowServer-.*\.ips$')
+    local base n now added previous=0
+    base=$(ls "$DR" | grep -Ec '^WindowServer[-_].*\.(ips|spin)$')
     while sleep 15; do
-        n=$(ls $DR | grep -c '^WindowServer-.*\.ips$'); [ $n -gt $base ] || continue
-        now=$(date +%s); [ $first = 0 ] && first=$now
-        if [ $((n - base)) -ge 2 ]; then
-            echo "$(date '+%F %T') WindowServer hung $((n - base)) times on the GPU: rebooting"
+        n=$(ls "$DR" | grep -Ec '^WindowServer[-_].*\.(ips|spin)$')
+        if [ "$n" -lt "$base" ]; then
+            base=$n; previous=0; continue
+        fi
+        added=$((n - base)); base=$n
+        [ "$added" -gt 0 ] || continue
+        now=$(date +%s)
+        if [ "$added" -ge 2 ] || { [ "$previous" -gt 0 ] && [ "$now" -ge "$previous" ] && [ $((now - previous)) -le 300 ]; }; then
+            echo "$(date '+%F %T') WindowServer hung twice within 5 minutes on the GPU: rebooting"
             echo $now >> $G/hang-reboots
             if [ $(awk -v t=$((now - 3600)) '$1 > t' $G/hang-reboots | wc -l) -ge 3 ]; then
                 echo "3 GPU hangs within an hour: WindowServer goes back to the firmware framebuffer"
@@ -110,7 +115,7 @@ watch_hangs() {
             fi
             sync; ${PHX_REBOOT:-shutdown -r now}; return
         fi
-        [ $((now - first)) -gt 300 ] && { base=$n; first=0; }
+        previous=$now
     done
 }
 [ $M2 = 1 ] && watch_hangs
