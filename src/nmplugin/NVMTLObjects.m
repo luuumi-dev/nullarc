@@ -2907,10 +2907,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             [cb->_resources addObject:t];
             NVMTLTexture *sr = t->_parent ? t->_parent : t;
             if (sr->_surf) {
-                if (ca.loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(cb, sr);
-                else nvmtl_surface_in_for_cb(cb, sr);
+                // A render clear may cover only a view or the pass's smaller render area.
+                nvmtl_surface_in_for_cb(cb, sr);
                 nvmtl_surf_dirty(cb, sr); }
-            else if (sr->_bufCopy) { if (ca.loadAction != MTLLoadActionClear) nvmtl_surface_in_for_cb(cb, sr); nvmtl_surf_dirty(cb, sr); }
+            else if (sr->_bufCopy) { nvmtl_surface_in_for_cb(cb, sr); nvmtl_surf_dirty(cb, sr); }
         }
         MTLStoreAction sa = ca.storeAction;
         if ((sa == MTLStoreActionMultisampleResolve || sa == MTLStoreActionStoreAndMultisampleResolve || sa == MTLStoreActionUnknown) && rx) {
@@ -5066,10 +5066,10 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
             (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
             d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil);
         if (sr->_surf) {
-            if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
-            else nvmtl_surface_in_for_cb(self, sr);
+            // A render clear may cover only a view or the pass's smaller render area.
+            nvmtl_surface_in_for_cb(self, sr);
             nvmtl_surf_dirty(self, sr); }
-        else if (sr->_bufCopy) { if (d.colorAttachments[0].loadAction != MTLLoadActionClear) nvmtl_surface_in_for_cb(self, sr); nvmtl_surf_dirty(self, sr); } }
+        else if (sr->_bufCopy) { nvmtl_surface_in_for_cb(self, sr); nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };
     nvmtl_vk_cmd_set_blend_color(&_c, defaultBlend);
     nvmtl_vk_cmd_set_line_width(&_c, 1.0f);
