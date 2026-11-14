@@ -460,6 +460,9 @@ IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice
         // timeout and fail (loginwindow died in RenderBox one second after a wake, and WindowServer closed with it).
         // Let the GPU finish what it has, then hold new submissions in gpuSubmit().
         isSleeping = true;
+        // GFX goes into the sleep powered up and with GFXOFF disallowed: closing the lid with GFX off reset the machine
+        // before the hibernation image was written (2026-11-14). isSleeping keeps the tick from allowing it again.
+        gfxOn();
         if (gpuLock && gpuReady()) {
             for (int i = 0; i < 2000 && gpuRetired() < gSeq; i++)
                 IOSleep(1);
@@ -1014,7 +1017,7 @@ void PhxBringup::gfxOn() {
 }
 
 void PhxBringup::gfxOffCheck() {
-    if (!goLock || !mmio || suspended || goAllowed || !gGfxOff || !gq[1].ready)
+    if (!goLock || !mmio || suspended || isSleeping || goAllowed || !gGfxOff || !gq[1].ready)
         return;
     IOLockLock(goLock);
     uint64_t idle;
@@ -1023,7 +1026,7 @@ void PhxBringup::gfxOffCheck() {
     for (GpuQueue &q : gq)
         if (q.ready && q.head != q.tail && q.fseq[(q.tail - 1) & 63] > queueFence(q))
             busy = true;
-    if (!busy && !goAllowed && !suspended) {
+    if (!busy && !goAllowed && !suspended && !isSleeping) {
         if (rreg(0xec43) != 1) {                       // RLC_PG_CNTL: lost with every bring-up
             wreg(kRegRlcSafeMode, 0x3);
             for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
