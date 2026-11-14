@@ -1,19 +1,42 @@
 // Verify Metal clears the entire attachment despite a smaller render area.
-// Usage: clearprobe [view]
-// Compile with -fobjc-arc -framework Foundation -framework Metal -framework IOSurface.
+// Usage: clearprobe [view]; NULLARC_TEST_PLUGIN=/absolute/path selects an isolated build.
+// Compile with -fobjc-arc -framework Foundation -framework Metal -framework IOSurface -framework IOKit.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+#import <IOKit/IOKitLib.h>
+#import <objc/runtime.h>
+
+@interface NSObject (ClearProbeDeviceInit)
+- (instancetype)initWithAcceleratorPort:(mach_port_t)port;
+@end
+
+static id<MTLDevice> testDevice(void) {
+    const char *path = getenv("NULLARC_TEST_PLUGIN");
+    if (!path) return MTLCreateSystemDefaultDevice();
+    if (objc_getClass("NVMTLDevice")) { fprintf(stderr, "plugin class already loaded; refusing ambiguous test\n"); return nil; }
+    if (!dlopen(path, RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr, "plugin load failed: %s\n", dlerror()); return nil; }
+    Class cls = NSClassFromString(@"NVMTLDevice");
+    if (!cls || ![cls instancesRespondToSelector:@selector(initWithAcceleratorPort:)]) return nil;
+    io_service_t accel = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
+    if (!accel) return nil;
+    id<MTLDevice> device = [[cls alloc] initWithAcceleratorPort:accel];
+    IOObjectRelease(accel);
+    printf("test plugin=%s\n", path);
+    return device;
+}
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
         const NSUInteger width = 8, height = 4;
         const BOOL view = argc == 2 && !strcmp(argv[1], "view");
         if (argc > 2 || (argc == 2 && !view)) return 2;
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        id<MTLDevice> device = testDevice();
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (!device || !queue) { fprintf(stderr, "no Metal device/queue\n"); return 1; }
         IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)@{
