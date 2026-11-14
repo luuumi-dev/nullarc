@@ -267,6 +267,7 @@ private:
     Bo *findBo(uint32_t h);
     bool ibCovered(uint64_t vaCanon, uint64_t bytes);
     void freeAll();
+    bool waitIdle();
 
     PhxBringup *owner{nullptr};
     IOLock *lock{nullptr};
@@ -1633,6 +1634,18 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
     return kIOReturnSuccess;
 }
 
+// Called under the client lock, so no later submission can race resource teardown.
+bool IOAccelPhxNativeClient::waitIdle() {
+    if (!lastSeq)
+        return true;
+    for (unsigned i = 0; i < 5000; i++) {
+        if (owner->gpuRetired() >= lastSeq)
+            return true;
+        IOSleep(1);
+    }
+    return owner->gpuRetired() >= lastSeq;
+}
+
 IOReturn IOAccelPhxNativeClient::doBoFree(IOExternalMethodArguments *a) {
     if (!shape(a, 1, 0, 0, 0))
         return kIOReturnBadArgument;
@@ -1640,6 +1653,9 @@ IOReturn IOAccelPhxNativeClient::doBoFree(IOExternalMethodArguments *a) {
     Bo *b = findBo(h);
     if (!b)
         return kIOReturnNotFound;
+    if (!waitIdle())
+        return kIOReturnBusy;
+    retireFences(owner->gpuRetired());
     for (int i = 0; i < kMaxMaps; i++)
         if (maps[i].used && maps[i].handle == h) {
             if (vmid && owner)
@@ -1751,6 +1767,8 @@ IOReturn IOAccelPhxNativeClient::doGemVa(IOExternalMethodArguments *a) {
     }
     for (int i = 0; i < kMaxMaps; i++) {
         if (maps[i].used && maps[i].handle == v->handle && maps[i].va == va && maps[i].size == v->map_size) {
+            if (!waitIdle())
+                return kIOReturnBusy;
             maps[i].used = false;
             if (vmid)
                 owner->vmUnmap(vmid, va, v->map_size);
