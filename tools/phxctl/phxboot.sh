@@ -32,6 +32,10 @@ m2_fail() {
     apps_only; sysctl -w debug.phxagdc=0 >/dev/null 2>&1
     nvram -d phxfb-boot; nv_commit; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
 }
+gpu_fail() {
+    [ "$M2" = 1 ] && m2_fail "$1"
+    echo "$1"; release; rm -f "$MARK"; exit 1
+}
 # PhxAMDFB comes from the Aux KC, which loads well after PhxBringup: wait for the panel's framebuffer (PhxAMDFB, or
 # IONDRV when PhxAMDFB was not armed) before telling which one took it
 wait_fb() { for i in $(seq 1 90); do ioreg -rc IOFramebuffer -d0 | grep -q 'class ' && break; sleep 1; done; }
@@ -49,20 +53,19 @@ ioreg -l | grep -q '"phx-build"' || { [ $M2 = 1 ] && m2_fail "PhxBringup not loa
 echo "PhxAMDFB on the panel: $M2"
 touch "$MARK"; sync
 apps_only
-MC=1 CS=1 ADOPT=1 GFX=1 AG=1 bash $G/full.sh kiqsched | grep -E "^compute:|^gfx:|adopt"
-$G/phxctl/mesboot claim
+(set -o pipefail; MC=1 CS=1 ADOPT=1 GFX=1 AG=1 bash $G/full.sh kiqsched | grep -E "^compute:|^gfx:|adopt") || gpu_fail "GPU bring-up failed"
+$G/phxctl/mesboot claim || gpu_fail "accelerator claim failed"
 # no BO cache flushing per submit/wait (the GPU maps system memory snooped): 41 fps window drag instead of 13, and no
 # artifacts seen (2026-10-20)
 sysctl -w debug.phxbos_flush=0 >/dev/null 2>&1
 for i in $(seq 1 20); do ioreg -rc NMXAccel -d0 | grep -q NMXAccel && break; sleep 1; done
 if ! ioreg -rc NMXAccel -d0 | grep -q NMXAccel; then
-    [ $M2 = 1 ] && m2_fail "NMXAccel did not start"
-    echo "NMXAccel did not start"; release; rm -f "$MARK"; exit 0
+    gpu_fail "NMXAccel did not start"
 fi
 if [ $M2 = 1 ]; then
-    sysctl -w debug.nvaccelfb=1 >/dev/null; sleep 1
-    sysctl -w debug.nvaccel_iop=1 >/dev/null; sysctl -w debug.nvaccelfb=3 >/dev/null; sleep 1
-    sysctl -w debug.phxagdc=1 >/dev/null; sleep 1
+    sysctl -w debug.nvaccelfb=1 >/dev/null || m2_fail "framebuffer preparation failed"; sleep 1
+    sysctl -w debug.nvaccel_iop=1 >/dev/null || m2_fail "scanout preparation failed"; sysctl -w debug.nvaccelfb=3 >/dev/null || m2_fail "framebuffer arming failed"; sleep 1
+    sysctl -w debug.phxagdc=1 >/dev/null || m2_fail "AGDC arming failed"; sleep 1
     # frames copied with SSE streaming loads (XMM saved around them): 1.0 ms a frame against 2.1 (2026-10-20)
     sysctl -w debug.nvaccel_iop_sse=1 >/dev/null
     # a copied frame completes on the next VBL tick, as a flip latches: fewer frames presented twice within one refresh
