@@ -52,6 +52,7 @@ test: $(TESTS)
 	python3 tests/test_native_sysmem.py
 	python3 tests/test_install_safety.py
 	python3 tests/test_release_pci_matches.py
+	python3 tests/test_ue200watch.py
 	@echo "=== Running RDNA 3 Driver Unit Tests ==="
 	@for t in $(TESTS); do \
 		echo "Running $$t..."; \
