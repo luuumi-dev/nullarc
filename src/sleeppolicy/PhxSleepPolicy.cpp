@@ -13,6 +13,7 @@
 #include <sys/sysctl.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <kern/thread_call.h>
+#include <pexpert/pexpert.h>
 
 struct PolicyVars {            // IOPMSystemSleepPolicyVariables (xnu IOPMPrivate.h)
     uint32_t signature, version; uint64_t currentCapability, highestCapability, sleepFactors;
@@ -86,7 +87,7 @@ static void copyKey(void) {
 // OS runs in EC0._REG (XSEC = OSEC) and again in _WAK, but there only for Arg0 == 4, which macOS does not pass on this
 // path. Running the EC's _REG(3, 1) again after every wake puts the EC back into ACPI mode.
 static int gEcReg = 0, gEcRegLast = -1;
-SYSCTL_INT(_debug, OID_AUTO, phxsleep_ecreg, CTLFLAG_RD, &gEcReg, 0, "EC0._REG evaluations after a wake");
+SYSCTL_INT(_debug, OID_AUTO, phxsleep_ecreg, CTLFLAG_RD, &gEcReg, 0, "EC _REG(3, 1) evaluations (initial power-on and every wake)");
 SYSCTL_INT(_debug, OID_AUTO, phxsleep_ecreg_last, CTLFLAG_RD, &gEcRegLast, 0, "result of the last one (0 = ok)");
 static void ecRegister(thread_call_param_t, thread_call_param_t) {
     // the EC by its _HID, as AppleACPIEC finds it
@@ -114,6 +115,23 @@ static int ecRegNow(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req
 SYSCTL_PROC(_debug, OID_AUTO, phxsleep_ecreg_now, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ecRegNow, "I", "write 1: evaluate the EC's _REG(3, 1) now");
 static thread_call_t gEcCall;
 
+// At the initial power-on too. ACPICA runs _REG(EmbeddedControl, 1) only for the OperationRegions of that space, and the
+// interpreter in AppleACPIPlatform does not run the "orphan" EC _REG that newer ACPICA (Linux) and Windows run when an EC
+// has none: on an ACEMAGIC RX16 every EC field lives in a SystemMemory window (ERAX), so _REG never runs under macOS,
+// OSFG ("an ACPI OS is present") stays 0, the EC handles the lid by itself and never raises _Q0C/_Q0D. Once the ACPI EC
+// driver is up, run it once. Where macOS did run it, this repeats the same _REG(3, 1) that a re-registration of the
+// region would. The boot-arg -phxsleepnoecreg leaves the initial power-on alone (the wake path stays).
+static IONotifier *gEcNotifier;
+static bool ecDriverUp(void *, void *, IOService *, IONotifier *n) {
+    static bool done = false;
+    if (!done && gEcCall) {
+        done = true;
+        uint64_t d; clock_interval_to_deadline(1000, kMillisecondScale, &d);
+        thread_call_enter_delayed(gEcCall, d);
+    }
+    return true;
+}
+
 class PhxSleepPolicy : public IOService {
     OSDeclareDefaultStructors(PhxSleepPolicy)
 public:
@@ -136,6 +154,14 @@ bool PhxSleepPolicy::start(IOService *provider) {
     sysctl_register_oid(&sysctl__debug_phxsleep_key_writes);
     sysctl_register_oid(&sysctl__debug_phxsleep_ecreg); sysctl_register_oid(&sysctl__debug_phxsleep_ecreg_last); sysctl_register_oid(&sysctl__debug_phxsleep_ecreg_now);
     gEcCall = thread_call_allocate(ecRegister, nullptr);
+    char flag = 0;
+    if (gEcCall && !PE_parse_boot_argn("-phxsleepnoecreg", &flag, sizeof flag)) {
+        OSDictionary *m = IOService::serviceMatching("AppleACPIEC");
+        if (m) {
+            gEcNotifier = addMatchingNotification(gIOFirstPublishNotification, m, ecDriverUp, nullptr);
+            m->release();
+        }
+    }
     static IOPMPowerState states[2] = {
         { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 } };
@@ -145,7 +171,7 @@ bool PhxSleepPolicy::start(IOService *provider) {
 }
 
 IOReturn PhxSleepPolicy::setPowerState(unsigned long ordinal, IOService *) {
-    static bool slept = false;   // not at the initial power-on, where the EC driver registers the region itself
+    static bool slept = false;   // the initial power-on is covered by ecDriverUp()
     if (ordinal == 0) { slept = true; copyKey(); }
     else if (gEcCall && slept) {   // two seconds after power-on: the ACPI EC driver is awake by then
         uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d);
