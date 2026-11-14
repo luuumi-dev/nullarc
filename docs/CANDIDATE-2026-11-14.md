@@ -40,3 +40,17 @@ SHA-256 до замены: `805cc00b4a31528de5374c65fc7c87893d0bff23d527b00ba5b1
 
 На 05:16 по часам Мака: uptime 3:57, phx_hang_kills=0. Этот снимок состояния
 не заменяет тест после установки. Замена пока не выполнялась.
+
+
+## Подготовленный подписанный bundle
+
+Копия создана без системных restricted metadata:
+`/tmp/nullarc-plugin-stage.nzyUyy/NVMTLDriver.bundle`.
+
+После ad-hoc подписи SHA-256 её NVMTLDriver:
+`bb235a25682e92a16d217c0bf1604dd68a77b99a988bd15e0d5d6f2d487dbad8`.
+Подпись меняет бинарник, поэтому этот hash отличается от исходного кандидата.
+`codesign --verify --strict` подтвердил valid on disk и Designated Requirement.
+Установленный бинарник сохранил hash 805cc00b…8fe966.
+Нативный sRGB slot-1 probe загружает именно эту подписанную копию: 0/32 ошибок.
+Установка и перезапуск сеанса не выполнялись.
