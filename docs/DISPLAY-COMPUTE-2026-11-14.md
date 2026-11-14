@@ -107,3 +107,42 @@ Read-only DMCUB: CNTL 0x36b6=0x001900c6 (enable=1), SCRATCH0
 не подтверждается; текущий modeset preflight должен отказать. Понадобится
 отдельно проверить загрузку/владение DMUB до интеграции HDMI; успешный
 modeset или hotplug этот снимок не доказывает.
+
+## Выбранный upstream путь zero-copy
+
+Для разрозненных страниц IOSurface требуется плоская GART/PTE таблица,
+не расширение AGP: 8 байт PTE на 4 KiB страницу, depth=0/block_size=0.
+Нужно получить именно DMA-адреса удерживаемого IOSurface memory descriptor,
+а не отдельного vramAlloc. CPU physical==DMA при IOMMU не предполагается.
+
+Linux v6.12 dcn20_vmid_setup задаёт START/END в страницах (>>12),
+CNTL depth/block, BASE_HI и BASE_LO последним; root не сдвигается на 12.
+Далее ждёт BASE_LO bit0. Это ACK контекста, а не display completion.
+В hubbub31_init_dchub_sys_ctx таблицы 0 и 15 одинаковы; отдельный VMID15
+сам по себе не доказывает безопасность изоляции от firmware scanout.
+
+Нужны также HUBP system aperture/TLB и DCHVM hostVM/rIOMMU-последовательность;
+эти настройки влияют на общий display. Значения AGP 0/0/0 нельзя считать
+отключением AGP (upstream отключает BOT>TOP). Сначала сохранить регистры
+и проверить DMA mapping. Для первого запуска использовать постоянные PTE
+удерживаемого пула; изменение живых PTE требует проверенного invalidation.
+
+Обычный vblank flip (immediate=0) переключает VMID, затем address HIGH/LOW;
+producer fence ждётся до flip. Старые pages/table/map держать до pending=0
+и EARLIEST_INUSE==новый адрес на всех использующих HUBP. До готовности этих
+частей существующий guard не снимать.
+
+Проверенные первоисточники (тот же pinned commit, ссылки выше):
+- display/dc/dcn20/dcn20_vmid.c, dcn20_vmid_setup (44–98).
+- display/dc/hubbub/dcn31/dcn31_hubbub.c, init_dchub_sys_ctx (905–938).
+- display/dc/hubbub/dcn21/dcn21_hubbub.c, dchvm_init (67–105).
+- display/dc/hubp/dcn30/dcn30_hubp.c, aperture и flip (45–131).
+- display/amdgpu_dm/amdgpu_dm_plane.c, framebuffer GART binding (959–986).
+- amdgpu/amdgpu_gart.c, flush/invalidation (394–415).
+
+Для нативной сборки исправленного переводчика Rust установлен из официального
+rustup в /Users/dripside/gpu/rust-build/{cargo,rustup}, без изменения shell PATH
+и без sudo. Sources staging: /Users/dripside/gpu/nullarc-translator-b29.
+Реальный Geekbench IR найден в ~/gpu/linkdump/nvmtl-link-4925:
+depthwiseConv_3x3.linked.ll (570032 bytes) и .fc.txt (8 constants, 130 bytes).
+Он скопирован для проверки; повторная трансляция новой библиотекой ещё впереди.
