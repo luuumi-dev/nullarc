@@ -1,4 +1,4 @@
-"""Replay actual render surface preparation branches with a partial clear."""
+"""Replay actual render surface preparation branches; verify conservative import bookkeeping."""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,19 +15,19 @@ def preparation(source, start):
 
 
 class RenderSurfaceClear(unittest.TestCase):
-    def test_partial_clear_preserves_untouched_pixels(self):
+    def test_clear_does_not_claim_whole_root_overwritten(self):
         source = (ROOT / 'src/nmplugin/NVMTLObjects.m').read_text()
         secondary = preparation(source, source.index('if (i) {', source.index('uint32_t load = 0')))
         primary = preparation(source, source.index('- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:'))
         code = r'''
 #include <cassert>
 struct Texture { bool _surf, _bufCopy; int cpu[4]={1,2,3,4}; int gpu[4]={9,9,9,9}; };
-struct Buffer { bool overwritten=false; };
+struct Buffer { bool overwritten=false; int imports=0; };
 struct Attachment { int loadAction; };
 struct Descriptor { Attachment colorAttachments[1]; };
 constexpr int MTLLoadActionClear=2;
 void nvmtl_surface_in_for_cb(Buffer *cb, Texture *t) {
-    if (!cb->overwritten) for (int i=0;i<4;i++) t->gpu[i]=t->cpu[i];
+    if (!cb->overwritten) { cb->imports++; for (int i=0;i<4;i++) t->gpu[i]=t->cpu[i]; }
 }
 void nvmtl_surface_overwrite_recorded(Buffer *cb, Texture *) { cb->overwritten=true; }
 void nvmtl_surf_dirty(Buffer *, Texture *) {}
@@ -39,9 +39,8 @@ int main() {
     for (bool primaryPath : {false,true}) for (bool surface : {false,true}) for (int action : {1,2}) {
         Texture texture{surface,!surface}; Buffer cb; Descriptor d{{{action}}};
         if (primaryPath) primary(&cb,&texture,d); else secondary(&cb,&texture,d.colorAttachments[0]);
-        // Vulkan clears only this pass's smaller render area, then another command reads the rest.
-        if (action==MTLLoadActionClear) texture.gpu[0]=0;
-        assert(texture.gpu[1]==2 && texture.gpu[2]==3 && texture.gpu[3]==4);
+        // This model verifies bookkeeping, not Metal clear semantics or Vulkan execution.
+        assert(cb.imports==1);
         assert(!cb.overwritten);
     }
 }
