@@ -4786,7 +4786,7 @@ static void *nvmtl_rp_variant(nvk_pipeline *p, uint32_t load, uint32_t was)
     }
     if (!rp && !legacy && p->nrpx >= p->crpx)
         nvlog("vk: apps2 load variant 0x%x on pipeline %p: rpx holds %u of a DERIVED ceiling of %u and did not grow — "
-              "THIS PASS CLEARS INSTEAD OF LOADING and the attachment's previous contents are LOST",
+              "required LOAD variant unavailable; pass will be refused",
               load, (void *)p, p->crpx, NVMTL_RPX_MAX);
     else if (!rp) {
         VkRenderPass made = VK_NULL_HANDLE;
@@ -4794,8 +4794,8 @@ static void *nvmtl_rp_variant(nvk_pipeline *p, uint32_t load, uint32_t was)
         if (r == VK_SUCCESS && legacy) { rp = p->rpv[load] = (void *)made; nvlog("vk: G11 load-action render pass variant %u made (%u colour slot(s), colour %s, depth %s)", load, ncol, (load & 1u) ? "LOAD" : "clear", (load & 2u) ? "LOAD" : "clear"); }
         else if (r == VK_SUCCESS) { rp = (void *)made; p->rpxk[p->nrpx] = load; p->rpx[p->nrpx++] = rp;
             nvlog("vk: apps2 load variant 0x%x made (%u colour slot(s), stencil %s)", load, ncol, (load & NVMTL_LOAD_STENCIL) ? "LOAD" : "clear"); }
-        else if (legacy) nvlog("vk: G11 vkCreateRenderPass(variant %u) -> %d — this pass CLEARS instead of loading", load, r);
-        else nvlog("vk: apps2 vkCreateRenderPass(variant 0x%x) -> %d — this pass CLEARS instead of loading", load, r);
+        else if (legacy) nvlog("vk: G11 vkCreateRenderPass(variant %u) -> %d — required LOAD variant unavailable", load, r);
+        else nvlog("vk: apps2 vkCreateRenderPass(variant 0x%x) -> %d — required LOAD variant unavailable", load, r);
     }
     pthread_mutex_unlock(&g_rpv_lock);
     if (rp && (load & 1u) && was != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && was != VK_IMAGE_LAYOUT_UNDEFINED) {
@@ -4950,7 +4950,7 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     if (p->has_depth && ps->ds && ps->ds->samples > 1 && g_sample_locations &&
         (ps->load & (NVMTL_LOAD_DEPTH | NVMTL_LOAD_STENCIL)))
         nvmtl_private_depth_layout(c, ps->ds, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    VkImageView views[2 * NVMTL_NCOL + 2]; uint32_t nviews = 0, was = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; int first = 1;
+    VkImageView views[2 * NVMTL_NCOL + 2]; uint32_t nviews = 0, was = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     uint32_t prm = 0;
     for (uint32_t i = 0; p->samples > 1 && i < ncol; i++) if (cf[i] && (rmask & (1u << i)) && ps->res[i] && ps->resview[i]) prm |= 1u << i;
     const int dres = p->samples > 1 && p->has_depth && ps->dres && ps->dresview && (ps->dresmode || ps->sresmode);
@@ -4960,9 +4960,11 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
         if (!rpShape) { nvlog("begin_render: par1 no resolve-shape render pass — pass REFUSED"); return -1; }
         static int said; if (said++ < 8) nvlog("begin_render: par1 %u-sample pass resolves colour 0x%x of 0x%x%s", p->samples, prm, rmask, dres ? " + depth/stencil" : "");
     }
+    for (uint32_t i = 0; i < ncol; i++) if (cf[i]) { was = ps->col[i]->layout; break; }
+    void *rpUse = rpShape ? rpShape : nvmtl_rp_variant(p, ps->load, was);
+    if (!rpUse) { nvlog("begin_render: required load variant unavailable — pass REFUSED"); return -1; }
     for (uint32_t i = 0; i < ncol; i++) {
         if (!cf[i]) continue;
-        if (first) { was = ps->col[i]->layout; first = 0; }
         ps->col[i]->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         views[nviews++] = (VkImageView)ps->colview[i];
     }
@@ -4992,8 +4994,6 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     VkClearValue cv[2 * NVMTL_NCOL + 1]; uint32_t ncv = 0; memset(cv, 0, sizeof cv);
     for (uint32_t i = 0; i < ncol; i++) if (cf[i]) { nvmtl_clear_colour(&cv[ncv].color, cf[i], ps->clear[i]); ncv++; }
     if (p->has_depth) { cv[ncv].depthStencil.depth = ps->clear_depth; cv[ncv].depthStencil.stencil = ps->clear_stencil; ncv++; }
-    void *rpUse = rpShape ? rpShape : nvmtl_rp_variant(p, ps->load, was);
-    if (!rpUse) rpUse = p->rp;
     VkRenderPassBeginInfo rbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, (VkRenderPass)rpUse, c->fb,
         { { 0, 0 }, { ps->w, ps->h } }, ncv, cv };
     c->sample_pattern = pattern;

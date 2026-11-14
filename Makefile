@@ -55,6 +55,7 @@ test: $(TESTS)
 	python3 tests/test_release_pci_matches.py
 	python3 tests/test_ue200watch.py
 	python3 tests/test_phxboot_watch.py
+	python3 tests/test_render_load_failure.py
 	python3 tests/test_format_view_clear.py
 	python3 tests/test_render_surface_clear.py
 	python3 tests/test_scanout_dump.py
