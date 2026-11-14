@@ -55,6 +55,7 @@ test: $(TESTS)
 	python3 tests/test_release_pci_matches.py
 	python3 tests/test_ue200watch.py
 	python3 tests/test_phxboot_watch.py
+	python3 tests/test_scanout_dump.py
 	python3 tests/test_phxctl_cli.py
 	python3 tests/test_bringup_failures.py
 	@echo "=== Running RDNA 3 Driver Unit Tests ==="
