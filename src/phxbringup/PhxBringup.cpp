@@ -366,6 +366,9 @@ bool PhxBringup::start(IOService *provider) {
     gpuLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
+    uint32_t go = 0;   // boot-arg phxgfxoff=1: GFXOFF while idle from the start (debug.phx_gfxoff)
+    if (PE_parse_boot_argn("phxgfxoff", &go, sizeof(go)))
+        gGfxOff = go ? 1 : 0;
     if (mmio) {
         readFbLayout();
         // HDP flush window: the NBIO remap register holds the BAR5 byte offset where writing 0 flushes the
