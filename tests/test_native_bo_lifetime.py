@@ -181,6 +181,8 @@ struct PhxBringup {
     struct Hw { uint32_t ctx=1; } hwv[1];
     Lock mutex; Lock *gpuLock=&mutex;
     uint64_t retired=0;
+    bool stopped=false;
+    bool isStopped() const { return stopped; }
     unsigned tlb=0;
     uint64_t gpuRetiredLocked() const { assert(gpuLock->held); return retired; }
     VmCtx *vmCtx(uint32_t handle) { return handle==1 && vm[0].busy ? vm : nullptr; }
@@ -197,6 +199,9 @@ int main() {
     assert(owner.vm[0].busy && owner.vm[0].hw==8 && owner.hwv[0].ctx==1);
     assert(buffer.bytes[0]==0xab && !owner.tlb && !flushed);
     owner.retired=7;
+    owner.stopped=true;
+    assert(!owner.vmidFree(1, 7) && owner.vm[0].busy);
+    owner.stopped=false;
     assert(owner.vmidFree(1, 7));
     assert(!owner.vm[0].busy && !owner.vm[0].hw && !owner.hwv[0].ctx);
     assert(!buffer.bytes[0] && !buffer.bytes[4095] && owner.tlb==1 && flushed==64);

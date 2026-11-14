@@ -89,6 +89,10 @@ class PhxBringup : public IOService {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    void free() override;
+    bool beginAccess();
+    void endAccess();
+    bool isStopped() const { return __atomic_load_n(&stopped, __ATOMIC_ACQUIRE); }
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override;
 
     bool claimSession();
@@ -133,6 +137,8 @@ private:
     void readFbLayout();
     void clearRing();
 
+    IORWLock *lifecycleLock{nullptr};
+    bool stopped{false};
     const phx_topology *topology{nullptr};
     bool isSleeping{false};
     IOPCIDevice *pci{nullptr};
@@ -245,6 +251,7 @@ private:
         uint32_t flags;
     };
 
+    IOReturn dispatchMethod(uint32_t selector, IOExternalMethodArguments *a);
     IOReturn doHello(IOExternalMethodArguments *a);
     IOReturn doQueryInfo(IOExternalMethodArguments *a);
     IOReturn doTopology(IOExternalMethodArguments *a);
@@ -305,6 +312,9 @@ bool PhxBringup::start(IOService *provider) {
     if (PE_parse_boot_argn("-phxbringupoff", &dummy, sizeof(dummy)))
         return false;
     if (!IOService::start(provider))
+        return false;
+    lifecycleLock = IORWLockAlloc();
+    if (!lifecycleLock)
         return false;
     pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci)
@@ -375,7 +385,42 @@ bool PhxBringup::start(IOService *provider) {
     return true;
 }
 
+bool PhxBringup::beginAccess() {
+    if (!lifecycleLock)
+        return false;
+    IORWLockRead(lifecycleLock);
+    if (isStopped()) {
+        IORWLockUnlock(lifecycleLock);
+        return false;
+    }
+    return true;
+}
+
+void PhxBringup::endAccess() {
+    IORWLockUnlock(lifecycleLock);
+}
+
+void PhxBringup::free() {
+    if (lifecycleLock)
+        IORWLockFree(lifecycleLock);
+    IOService::free();
+}
+
 void PhxBringup::stop(IOService *provider) {
+    if (!lifecycleLock) {
+        IOService::stop(provider);
+        return;
+    }
+    IORWLockWrite(lifecycleLock);
+    if (isStopped()) {
+        IORWLockUnlock(lifecycleLock);
+        return;
+    }
+    __atomic_store_n(&stopped, true, __ATOMIC_RELEASE);
+    // Existing entry points have left before the writer lock is granted.
+    const bool quarantine = gq[0].ready || gq[1].ready || sysBuf;
+    if (quarantine)
+        retain(); // DMA cannot be proven stopped: keep service, maps, locks and page tables alive until reboot.
     if (hangCall) {
         hangStop = true;   // a tick running now does not arm the next one
         thread_call_cancel_wait(hangCall);
@@ -388,6 +433,13 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
         gSysctlUp = 0;
+    }
+    if (quarantine) {
+        IOLog("PhxBringup: stopped with DMA resources pinned; reboot required to unload safely\n");
+        IORWLockUnlock(lifecycleLock);
+        PMstop();
+        IOService::stop(provider);
+        return;
     }
     clearRing();
     if (fbAper) {
@@ -427,6 +479,7 @@ void PhxBringup::stop(IOService *provider) {
         IOLockFree(smuLock);
         smuLock = nullptr;
     }
+    IORWLockUnlock(lifecycleLock);
     PMstop();
     IOService::stop(provider);
 }
@@ -719,7 +772,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
 // A timeout never licenses teardown: callers retain all resources until this succeeds.
 bool PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
     IOLockLock(gpuLock);
-    if (gpuRetiredLocked() < lastSeq) {
+    if (isStopped() || gpuRetiredLocked() < lastSeq) {
         IOLockUnlock(gpuLock);
         return false;
     }
@@ -1492,7 +1545,7 @@ IOAccelPhxNativeClient::Bo *IOAccelPhxNativeClient::findBo(uint32_t h) {
 
 IOReturn IOAccelPhxNativeClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) {
     IOLockLock(lock);
-    if (closing) {
+    if (closing || owner->isStopped()) {
         IOLockUnlock(lock);
         return kIOReturnNotOpen;
     }
@@ -1516,6 +1569,14 @@ static bool shape(const IOExternalMethodArguments *a, uint32_t sin, uint32_t sou
 
 IOReturn IOAccelPhxNativeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
                                                 IOExternalMethodDispatch *, OSObject *, void *) {
+    if (!owner || !owner->beginAccess())
+        return kIOReturnNotReady;
+    const IOReturn result = dispatchMethod(selector, a);
+    owner->endAccess();
+    return result;
+}
+
+IOReturn IOAccelPhxNativeClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments *a) {
     if (selector == PHXN_SEL_WAITSEQ)
         return doWaitSeq(a);
     if (selector == PHXN_SEL_TOPOLOGY)
