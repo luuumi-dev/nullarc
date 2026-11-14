@@ -4874,6 +4874,20 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
         for (uint32_t i = 0; i < ncol; i++) {
             nvk_image *img = ps->col[i];
             if (!cf[i] || !img || (ps->load & NVMTL_LOAD_COLOUR(i)) || (ps->colw[i] <= ps->w && ps->colh[i] <= ps->h)) continue;
+            if (!c->in_rp && img->mtl_type != 7 && ps->colfmt[i] && ps->colfmt[i] != img->fmt) {
+                // Transfer clears use the image format; a full-size empty pass clears in the view's format instead.
+                nvk_pass viewclear; memset(&viewclear, 0, sizeof viewclear);
+                viewclear.col[0] = img; viewclear.colview[0] = ps->colview[i];
+                viewclear.colfmt[0] = ps->colfmt[i];
+                viewclear.colw[0] = viewclear.w = ps->colw[i];
+                viewclear.colh[0] = viewclear.h = ps->colh[i];
+                viewclear.col_level[0] = ps->col_level[i]; viewclear.col_layer[0] = ps->col_layer[i];
+                viewclear.layers = nl;
+                memcpy(viewclear.clear[0], ps->clear[i], sizeof viewclear.clear[0]);
+                if (nvmtl_vk_cmd_empty_pass(c, &viewclear)) return -1;
+                add |= NVMTL_LOAD_COLOUR(i);
+                continue;
+            }
             if (c->in_rp || img->mtl_type == 7 || (ps->colfmt[i] && ps->colfmt[i] != img->fmt)) {
                 static int said; if (said++ < 4) nvlog("begin_render: fullclear colour %u (%ux%u) is larger than the %ux%u render area but is a %s — only the area is cleared",
                     i, ps->colw[i], ps->colh[i], ps->w, ps->h, c->in_rp ? "pass in progress" : img->mtl_type == 7 ? "3D slice" : "format view");
