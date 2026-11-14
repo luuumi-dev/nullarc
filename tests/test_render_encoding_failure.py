@@ -24,10 +24,28 @@ int nvmtl_vk_cmd_begin_pass_impl(nvk_cmdbuf *, const nvk_pass *, nvk_pipeline *)
 int nvmtl_counter_flush(nvk_cmdbuf *) { return 0; }
 void nvmtl_cmd_retire(nvk_cmdbuf *) { retired++; }
 '''
+        events = (ROOT / 'src/nmplugin/NVMTLEventSync.m').read_text()
+        for index, anchor in enumerate(('if (!part->commands.encoding_error && !part->encoders',
+                                        'if (!ahead && part->commands.cb &&')):
+            begin = events.index(anchor) + len('if (')
+            end = events.index(') {', begin)
+            expression = events[begin:end]
+            code += ('\nstruct Counts%d { int count=0; };\n' % index +
+                     'struct Part%d { nvk_cmdbuf commands; int encoders=0; Counts%d resources,surfaces,scratch; };\n' % (index,index) +
+                     'bool skip%d(Part%d *part) { bool ahead=false; return ' % (index,index) + expression + '; }\n')
+        code = code.replace('struct nvk_cmdbuf { unsigned encoding_error=0; };',
+                            'struct nvk_cmdbuf { unsigned encoding_error=0; void *cb=(void *)1; };')
+        code += '\nbool nvmtl_skip_empty_on() { return true; }\n'
+        code = code.replace('static int failure, retired, submitted;',
+                            'static int failure, retired, submitted; bool nvmtl_skip_empty_on();')
         code += wrapper
         code += '\nint submit(nvk_cmdbuf *c) {\n' + source[guard_start:guard_end] + '\nsubmitted++; return 0; }\n'
         code += r'''
 int main() {
+    Part0 a; Part1 b;
+    assert(skip0(&a) && skip1(&b));
+    a.commands.encoding_error=b.commands.encoding_error=1;
+    assert(!skip0(&a) && !skip1(&b));
     nvk_cmdbuf c; nvk_pass pass; nvk_pipeline pipeline;
     assert(nvmtl_vk_cmd_begin_pass(&c,&pass,&pipeline)==0 && !c.encoding_error);
     assert(submit(&c)==0 && submitted==1);

@@ -571,7 +571,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
             continue;
         }
         if (!part->commands.cb) return NO;
-        if (!part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
+        if (!part->commands.encoding_error && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
             if (!nvmtl_evfold_on() || _nextSubmit + 1 >= _parts.count) return NO;
             [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
@@ -645,7 +645,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         uint64_t have = ((uint64_t(*)(id,SEL))objc_msgSend)(part->waitEvent,@selector(signaledValue));
         if (have < part->value) { @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; } return NO; }
     }
-    if (!ahead && part->commands.cb && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
+    if (!ahead && part->commands.cb && !part->commands.encoding_error && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
         [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         nvmtl_vk_cmd_abandon(&part->commands);
