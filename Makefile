@@ -50,6 +50,7 @@ test: $(TESTS)
 	python3 tests/test_native_stop.py
 	python3 tests/test_native_vm.py
 	python3 tests/test_native_sysmem.py
+	python3 tests/test_native_submit.py
 	python3 tests/test_install_safety.py
 	python3 tests/test_release_pci_matches.py
 	python3 tests/test_ue200watch.py

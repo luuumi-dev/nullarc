@@ -990,8 +990,9 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     }
     const uint32_t vmid = vmBind(handle);
     if (!vmid) {
+        const IOReturn result = vmHealthy() ? kIOReturnBusy : kIOReturnTimeout;
         IOLockUnlock(gpuLock);
-        return kIOReturnBusy;
+        return result;
     }
     uint32_t k = 0;
     for (uint32_t i = 0; i < n; i++) {
