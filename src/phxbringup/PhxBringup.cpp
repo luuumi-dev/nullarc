@@ -46,6 +46,17 @@ SYSCTL_INT(_debug, OID_AUTO, phx_hang_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gHangMs,
            "ms without progress before a hung submission's waves are killed (0 off)");
 SYSCTL_INT(_debug, OID_AUTO, phx_hang_kills, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gHangKills, 0,
            "hung submissions whose waves were killed");
+// debug.phx_gfxoff: 1 lets the PMFW power the whole GFX block down while nothing is submitted (Linux's GFXOFF). The
+// kext then arms the RLC's power gating (RLC_PG_CNTL, RLC_PG_DELAY_3) and sends AllowGfxOff once every queue has been
+// idle for debug.phx_gfxoff_ms, and sends DisallowGfxOff before it touches a GC register or a ring again: a register
+// written while GFX is off is lost (a VMID bound that way faulted on its first IB and hung the queue, 2026-11-14).
+// Needs SDMA out of halt (mesboot sdma_unhalt), or the RLC never gates anything. 0 (default) sends Disallow and stops.
+static int gGfxOff = 0, gGfxOffMs = 500;
+static volatile SInt32 gGfxOffAllows, gGfxOffWakes;
+SYSCTL_INT(_debug, OID_AUTO, phx_gfxoff, CTLFLAG_RW | CTLFLAG_LOCKED, &gGfxOff, 0, "allow GFXOFF while idle");
+SYSCTL_INT(_debug, OID_AUTO, phx_gfxoff_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gGfxOffMs, 0, "idle ms before AllowGfxOff");
+SYSCTL_INT(_debug, OID_AUTO, phx_gfxoff_allows, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gGfxOffAllows, 0, "AllowGfxOff sent");
+SYSCTL_INT(_debug, OID_AUTO, phx_gfxoff_wakes, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gGfxOffWakes, 0, "DisallowGfxOff sent");
 // GC 11.0.1 registers (segment 0 base 0x1260, segment 1 base 0xa000)
 static constexpr uint32_t kRegSqCmd = 0x1260 + 0x111b, kRegRlcSafeMode = 0xa000 + 0x0980;
 static volatile UInt32 gSysctlUp;
@@ -96,6 +107,11 @@ public:
     IOReturn doorbellWrite(uint64_t byteOff, uint64_t value);
     IOReturn sysMem(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0, uint64_t *out1);
     IOReturn smuMessage(uint32_t msg, uint32_t arg, uint32_t *resp, uint32_t *argAfter);
+    void gfxOn();        // before any GC register or ring access: take GFX out of GFXOFF and keep it on for now
+    void gfxOffCheck();  // from the 500 ms tick: allow GFXOFF once everything has been idle long enough
+    IOLock *goLock{nullptr};
+    bool goAllowed{false};
+    uint64_t goLastUse{0};
     IOReturn pspRing(uint32_t op, uint64_t carveOffset, uint64_t out[4]);
     IOReturn pspSubmit(uint32_t cmdId, uint64_t out[4]);
     IOReturn fwStage(uint32_t dstOffset, const void *bytes, uint32_t len);
@@ -346,6 +362,7 @@ bool PhxBringup::start(IOService *provider) {
     }
     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     smuLock = IOLockAlloc();
+    goLock = IOLockAlloc();
     gpuLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
@@ -387,6 +404,10 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phx_gfxoff);
+        sysctl_unregister_oid(&sysctl__debug_phx_gfxoff_ms);
+        sysctl_unregister_oid(&sysctl__debug_phx_gfxoff_allows);
+        sysctl_unregister_oid(&sysctl__debug_phx_gfxoff_wakes);
         gSysctlUp = 0;
     }
     clearRing();
@@ -746,6 +767,7 @@ void PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
             flushLine(p + o);
     }
     if (c.hw) {
+        gfxOn();
         vmFlushTlb(c.hw);
         hwv[c.hw - kFirstUserVmid].ctx = 0;
         c.hw = 0;
@@ -772,6 +794,8 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
     // and the bring-up ran a second time. The page tables of every client context are system memory and came back with
     // the hibernation image, but the page-table base registers of the hardware VMIDs did not: forget the bindings, so
     // the next submission of each context programs its VMID again (vmBind) instead of running on an unmapped one.
+    if (qi == 0)
+        goAllowed = false;   // a fresh bring-up: the PMFW starts with GFXOFF disallowed
     if (qi == 0) {
         uint32_t n = 0;
         for (uint32_t i = 0; i < kMaxCtx; i++)
@@ -831,8 +855,10 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
         *pte = (pa & kPtAddrMask) | kPteSysFlags;
         flushLine(pte);
     }
-    if (c.hw)   // an unbound context is flushed when it is next bound
+    if (c.hw) {   // an unbound context is flushed when it is next bound
+        gfxOn();
         vmFlushTlb(c.hw);
+    }
     IOLockUnlock(gpuLock);
     return r;
 }
@@ -849,8 +875,10 @@ IOReturn PhxBringup::vmUnmap(uint32_t handle, uint64_t va, uint64_t size) {
             flushLine(pte);
         }
     }
-    if (c.hw)
+    if (c.hw) {
+        gfxOn();
         vmFlushTlb(c.hw);
+    }
     IOLockUnlock(gpuLock);
     return kIOReturnSuccess;
 }
@@ -918,6 +946,7 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
         }
         IODelay(50);
     }
+    gfxOn();   // GFX may be powered down (GFXOFF): up before the VMID registers and the ring are touched
     const uint32_t vmid = vmBind(handle);
     if (!vmid) {
         IOLockUnlock(gpuLock);
@@ -968,11 +997,59 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     return kIOReturnSuccess;
 }
 
+void PhxBringup::gfxOn() {
+    if (!goLock)
+        return;
+    IOLockLock(goLock);
+    goLastUse = mach_absolute_time();
+    if (goAllowed) {
+        uint32_t resp = 0, arg = 0;
+        smuMessage(0x1a, 0, &resp, &arg);              // DisallowGfxOff: the PMFW powers GFX up before it answers
+        for (int i = 0; i < 5000 && rreg(0x2004) == 0; i++)   // GRBM_STATUS reads 0 while GFX is off
+            IODelay(10);
+        goAllowed = false;
+        OSIncrementAtomic(&gGfxOffWakes);
+    }
+    IOLockUnlock(goLock);
+}
+
+void PhxBringup::gfxOffCheck() {
+    if (!goLock || !mmio || suspended || goAllowed || !gGfxOff || !gq[1].ready)
+        return;
+    IOLockLock(goLock);
+    uint64_t idle;
+    nanoseconds_to_absolutetime(static_cast<uint64_t>(gGfxOffMs > 0 ? gGfxOffMs : 0) * 1000000ull, &idle);
+    bool busy = mach_absolute_time() - goLastUse < idle;
+    for (GpuQueue &q : gq)
+        if (q.ready && q.head != q.tail && q.fseq[(q.tail - 1) & 63] > queueFence(q))
+            busy = true;
+    if (!busy && !goAllowed && !suspended) {
+        if (rreg(0xec43) != 1) {                       // RLC_PG_CNTL: lost with every bring-up
+            wreg(kRegRlcSafeMode, 0x3);
+            for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
+                IODelay(1);
+            wreg(0xec43, 1);                           // GFX_POWER_GATING_ENABLE
+            wreg(0xec78, 0x1388);                      // RLC_PG_DELAY_3, RLC_PG_DELAY_3_DEFAULT_GC_11_0_1
+            wreg(kRegRlcSafeMode, 0x1);
+        }
+        uint32_t resp = 0, arg = 0;
+        if (smuMessage(0x19, 0, &resp, &arg) == kIOReturnSuccess) {   // AllowGfxOff
+            goAllowed = true;
+            OSIncrementAtomic(&gGfxOffAllows);
+        }
+    }
+    IOLockUnlock(goLock);
+}
+
 // Every 500 ms: a queue with unfinished work whose fence has not moved for debug.phx_hang_ms has the waves of its oldest
 // unfinished submission killed, the CP then finishes that submission as if it had ended and the queue moves on.
 void PhxBringup::hangTick(thread_call_param_t self, thread_call_param_t) {
     PhxBringup *me = static_cast<PhxBringup *>(self);
     me->hangCheck();
+    if (gGfxOff)
+        me->gfxOffCheck();
+    else if (me->goAllowed)
+        me->gfxOn();
     if (me->hangStop)
         return;
     uint64_t d;
@@ -1024,6 +1101,7 @@ void PhxBringup::hangCheck() {
 // gfx_v11_0_ring_soft_recovery: SQ_CMD kill (CMD 3) broadcast (MODE 1), limited to one VMID unless `all`, inside RLC
 // safe mode
 void PhxBringup::killWaves(uint32_t vmid, bool all) {
+    gfxOn();
     wreg(kRegRlcSafeMode, 0x3);                        // CMD | MESSAGE 1: enter
     for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
         IODelay(1);
@@ -1356,6 +1434,10 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phx_gfxoff);
+        sysctl_register_oid(&sysctl__debug_phx_gfxoff_ms);
+        sysctl_register_oid(&sysctl__debug_phx_gfxoff_allows);
+        sysctl_register_oid(&sysctl__debug_phx_gfxoff_wakes);
     }
     if (type != PHXN_UC_TYPE)
         return kIOReturnBadArgument;
