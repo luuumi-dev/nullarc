@@ -137,6 +137,7 @@ private:
     void hdpFlush() const;
     void readFbLayout();
     void clearRing();
+    IOReturn sysMemLocked(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0, uint64_t *out1);
 
     IORWLock *lifecycleLock{nullptr};
     bool stopped{false};
@@ -577,34 +578,40 @@ IOReturn PhxBringup::writeReg(uint32_t reg, uint32_t value, uint32_t *readback) 
     return kIOReturnSuccess;
 }
 
-// Write one dword into VRAM at byteOff through the BAR0 aperture.
-// op 1: allocate a physically contiguous buffer of a bytes (replaces any previous), out0 = physical address
-// op 2: read dword at byte offset a -> out1;  op 3: write dword b at byte offset a;  op 4: free
+// Debug DMA storage: one allocation per boot; the raw register path has no verified reset protocol.
 IOReturn PhxBringup::sysMem(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0, uint64_t *out1) {
     *out0 = *out1 = 0;
+    if (!gpuLock)
+        return kIOReturnNotReady;
+    IOLockLock(gpuLock);
+    const IOReturn result = sysMemLocked(op, a, b, out0, out1);
+    IOLockUnlock(gpuLock);
+    return result;
+}
+
+IOReturn PhxBringup::sysMemLocked(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0, uint64_t *out1) {
+    if (op < 1 || op > 4)
+        return kIOReturnBadArgument;
     if (op == 1) {
-        if (sysBuf) {
-            sysBuf->release();
-            sysBuf = nullptr;
-        }
         if (a == 0 || a > (64ull << 20))
             return kIOReturnBadArgument;
-        sysBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        // shortcut: retain exposed debug DMA pages until reboot; replacement needs a proven GPU reset protocol.
+        if (sysBuf)
+            return kIOReturnBusy;
+        IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, a, 0x00007FFFFFFFF000ull);
-        if (!sysBuf)
+        if (!buffer)
             return kIOReturnNoMemory;
-        bzero(sysBuf->getBytesNoCopy(), a);
+        bzero(buffer->getBytesNoCopy(), a);
+        sysBuf = buffer;
         *out0 = sysBuf->getPhysicalAddress();
         *out1 = sysBuf->getLength();
         return kIOReturnSuccess;
     }
     if (!sysBuf)
         return kIOReturnNotReady;
-    if (op == 4) {
-        sysBuf->release();
-        sysBuf = nullptr;
-        return kIOReturnSuccess;
-    }
+    if (op == 4)
+        return kIOReturnBusy;
     if ((a & 3) || !phxRangeFits(a, 4, sysBuf->getLength()))
         return kIOReturnBadArgument;
     volatile uint32_t *p = reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(sysBuf->getBytesNoCopy()) + a);
@@ -614,12 +621,9 @@ IOReturn PhxBringup::sysMem(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0,
         *out0 = sysBuf->getPhysicalAddress();
         return kIOReturnSuccess;
     }
-    if (op == 3) {
-        *p = static_cast<uint32_t>(b);
-        __asm__ __volatile__("clflush (%0)\n\tmfence" ::"r"(p) : "memory"); // GPU walker may not snoop CPU caches
-        return kIOReturnSuccess;
-    }
-    return kIOReturnBadArgument;
+    *p = static_cast<uint32_t>(b);
+    __asm__ __volatile__("clflush (%0)\n\tmfence" ::"r"(p) : "memory");
+    return kIOReturnSuccess;
 }
 
 // ---- E8: GPU execution ------------------------------------------------------------------------------------

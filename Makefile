@@ -49,6 +49,7 @@ test: $(TESTS)
 	python3 tests/test_native_bo_lifetime.py
 	python3 tests/test_native_stop.py
 	python3 tests/test_native_vm.py
+	python3 tests/test_native_sysmem.py
 	python3 tests/test_install_safety.py
 	python3 tests/test_release_pci_matches.py
 	@echo "=== Running RDNA 3 Driver Unit Tests ==="
