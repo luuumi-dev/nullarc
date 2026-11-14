@@ -25,6 +25,7 @@
 #include "PhxNativeABI.h"
 #include "PhxGpuQueue.h"
 #include "PhxPendingFences.h"
+#include "PhxRange.h"
 
 #define PHX_KEXT_BUILD 34u
 
@@ -604,7 +605,7 @@ IOReturn PhxBringup::sysMem(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0,
         sysBuf = nullptr;
         return kIOReturnSuccess;
     }
-    if ((a & 3) || a + 4 > sysBuf->getLength())
+    if ((a & 3) || !phxRangeFits(a, 4, sysBuf->getLength()))
         return kIOReturnBadArgument;
     volatile uint32_t *p = reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(sysBuf->getBytesNoCopy()) + a);
     if (op == 2) {
@@ -806,8 +807,8 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
     const uint64_t ringOff = in[0], ringDw = in[1], wbOff = in[2], dbByte = in[3], wptr = in[4], fenceOff = in[5] & ~1ull;
     const uint32_t qi = static_cast<uint32_t>(in[5] & 1);
     if (ringDw < 256 || ringDw > 65536 || (ringDw & (ringDw - 1)) || (ringOff & 0xFF) ||
-        ringOff + ringDw * 4 > fbAperLen || (wbOff & 7) || wbOff + 32 > fbAperLen || (fenceOff & 7) ||
-        fenceOff + 8 > fbAperLen || (dbByte & 7) || dbByte + 8 > doorbellMap->getLength())
+        !phxRangeFits(ringOff, ringDw * 4, fbAperLen) || (wbOff & 7) || !phxRangeFits(wbOff, 32, fbAperLen) || (fenceOff & 7) ||
+        !phxRangeFits(fenceOff, 8, fbAperLen) || (dbByte & 7) || !phxRangeFits(dbByte, 8, doorbellMap->getLength()))
         return kIOReturnBadArgument;
     IOLockLock(gpuLock);
     GpuQueue &q = gq[qi];
@@ -847,23 +848,43 @@ IOReturn PhxBringup::claimAccel() {
 }
 
 IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md, uint64_t off, uint64_t size) {
-    if (!vmCtx(handle))
+    if (!md || !size || ((va | off | size) & 4095) ||
+        !phxRangeFits(off, size, md->getLength()) || !phxRangeFits(va, size, 1ull << 48))
+        return kIOReturnBadArgument;
+    IOLockLock(gpuLock);
+    if (!vmCtx(handle)) {
+        IOLockUnlock(gpuLock);
         return kIOReturnNotReady;
+    }
     VmCtx &c = vm[handle - 1];
     IOReturn r = kIOReturnSuccess;
-    IOLockLock(gpuLock);
-    for (uint64_t p = 0; p < size; p += 4096) {
+    uint64_t mapped = 0;
+    for (; mapped < size; mapped += 4096) {
         IOByteCount segLen = 0;
-        const addr64_t pa = md->getPhysicalSegment(off + p, &segLen, kIOMemoryMapperNone);
-        uint64_t *pte = pa ? vmPte(c, va + p, true) : nullptr;
+        const addr64_t pa = md->getPhysicalSegment(off + mapped, &segLen, kIOMemoryMapperNone);
+        if (!pa || (pa & 4095) || segLen < 4096) {
+            r = kIOReturnVMError;
+            break;
+        }
+        uint64_t *pte = vmPte(c, va + mapped, true);
         if (!pte) {
-            r = pa ? kIOReturnNoMemory : kIOReturnVMError;
+            r = kIOReturnNoMemory;
             break;
         }
         *pte = (pa & kPtAddrMask) | kPteSysFlags;
         flushLine(pte);
     }
-    if (c.hw)   // an unbound context is flushed when it is next bound
+    if (r != kIOReturnSuccess) {
+        // The caller publishes no Map on failure, so no PTE from this attempt may survive.
+        for (uint64_t p = 0; p < mapped; p += 4096) {
+            uint64_t *pte = vmPte(c, va + p, false);
+            if (pte) {
+                *pte = 0;
+                flushLine(pte);
+            }
+        }
+    }
+    if (c.hw)
         vmFlushTlb(c.hw);
     IOLockUnlock(gpuLock);
     return r;
@@ -1067,7 +1088,7 @@ void PhxBringup::killWaves(uint32_t vmid, bool all) {
 IOReturn PhxBringup::doorbellWrite(uint64_t byteOff, uint64_t value) {
     if (!doorbellMap)
         return kIOReturnNotReady;
-    if ((byteOff & 7) || byteOff + 8 > doorbellMap->getLength())
+    if ((byteOff & 7) || !phxRangeFits(byteOff, 8, doorbellMap->getLength()))
         return kIOReturnBadArgument;
     *reinterpret_cast<volatile uint64_t *>(doorbellMap->getVirtualAddress() + byteOff) = value;
     return kIOReturnSuccess;
@@ -1105,7 +1126,7 @@ IOReturn PhxBringup::pspRing(uint32_t op, uint64_t carveOffset, uint64_t out[4])
     if (op == 1) {
         if (ringMc) {
             r = kIOReturnExclusiveAccess;   // a ring is already live; destroy it first
-        } else if ((carveOffset & 0xFFF) || carveOffset + PHX_PSP_FENCE_REL + 0x1000 > PHX_VRAM_TMR_OFF ||
+        } else if ((carveOffset & 0xFFF) || !phxRangeFits(carveOffset, PHX_PSP_FENCE_REL + 0x1000, PHX_VRAM_TMR_OFF) ||
                    PHX_VRAM_FWBUF_OFF + PHX_VRAM_FWBUF_SIZE > fbAperLen) {
             r = kIOReturnBadArgument;        // ring+cmd+fence must sit below the TMR; fw_buf must fit the aperture
         } else {
@@ -1704,7 +1725,7 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
         return kIOReturnBadArgument;
     const phxn_gem_create_in *in = static_cast<const phxn_gem_create_in *>(a->structureInput);
     uint64_t size = in->bo_size;
-    if (size == 0)
+    if (size == 0 || size > ~0ull - 4095)
         return kIOReturnBadArgument;
     size = (size + 4095) & ~4095ull;
     uint64_t align = in->alignment;
@@ -1721,12 +1742,12 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
     uint32_t domain, bits;
     uint64_t *pool;
     if (d & PHX_AMDGPU_GEM_DOMAIN_VRAM) {
-        if (visUsed + size <= kVisTotal) {
+        if (phxRangeFits(visUsed, size, kVisTotal)) {
             domain = 4;
             bits = PHXN_PLACED_CPU_MAPPABLE | PHXN_PLACED_ZEROED;
             pool = &visUsed;
         } else if ((f & PHX_AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(f & PHX_AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) &&
-                   hiUsed + size <= kHiTotal) {
+                   phxRangeFits(hiUsed, size, kHiTotal)) {
             domain = 4;
             bits = PHXN_PLACED_HI_POOL | PHXN_PLACED_ZEROED;
             pool = &hiUsed;
@@ -1734,7 +1755,7 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
             return kIOReturnNoMemory;
         }
     } else {
-        if (size > kGttMaxBo || gttUsed + size > kGttCap)
+        if (size > kGttMaxBo || !phxRangeFits(gttUsed, size, kGttCap))
             return kIOReturnNoMemory;
         domain = 2;
         bits = PHXN_PLACED_ZEROED;
@@ -1822,9 +1843,10 @@ IOReturn IOAccelPhxNativeClient::doBoImportHost(IOExternalMethodArguments *a) {
     if (!shape(a, 4, 4, 0, 0))
         return kIOReturnBadArgument;
     const uint64_t va = a->scalarInput[0], size = a->scalarInput[1];
-    if (!va || !size || (va & 4095) || (size & 4095) || a->scalarInput[2] || a->scalarInput[3] || !task)
+    if (!va || !size || (va & 4095) || (size & 4095) || a->scalarInput[2] || a->scalarInput[3] || !task ||
+        !phxRangeFits(va, size, ~0ull))
         return kIOReturnBadArgument;
-    if (size > kHostMaxBo || hostUsed + size > kHostCap)
+    if (size > kHostMaxBo || !phxRangeFits(hostUsed, size, kHostCap))
         return kIOReturnNoMemory;
     uint32_t h = 1;
     while (h < PHXN_MAX_BOS && bos[h].md)
@@ -1869,9 +1891,9 @@ IOReturn IOAccelPhxNativeClient::doGemVa(IOExternalMethodArguments *a) {
     const uint64_t va = v->va_address & kVaMask;
     if (((v->va_address | v->offset_in_bo | v->map_size) & 4095) || v->map_size == 0)
         return kIOReturnBadArgument;
-    if (va < 0x10000 || va + v->map_size > (1ull << 48))
+    if (va < 0x10000 || !phxRangeFits(va, v->map_size, 1ull << 48))
         return kIOReturnBadArgument;
-    if (v->offset_in_bo + v->map_size > b->size)
+    if (!phxRangeFits(v->offset_in_bo, v->map_size, b->size))
         return kIOReturnBadArgument;
 
     if (v->operation == PHX_AMDGPU_VA_OP_MAP) {

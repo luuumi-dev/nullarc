@@ -222,6 +222,7 @@ int main() {
 #include <cstdint>
 #include <cstring>
 #include "phxbringup/PhxGpuQueue.h"
+#include "phxbringup/PhxRange.h"
 using IOReturn=int;
 constexpr int kIOReturnNotReady=1, kIOReturnBadArgument=2, kIOReturnBusy=3, kIOReturnSuccess=0;
 void bzero(void *p, size_t n) { std::memset(p,0,n); }
@@ -259,6 +260,12 @@ int main() {
     assert(q.tail==1 && q.fseq[0]==7 && q.ready && !owner.gpuLock->held);
     uint64_t done=7; std::memcpy(owner.memory.bytes+1536,&done,8);
     assert(owner.adoptQueue(in)==0 && q.ready && !q.tail && q.ringDw==256);
+    in[0]=~0ull-255;
+    assert(owner.adoptQueue(in)==kIOReturnBadArgument && q.ringDw==256);
+    in[0]=0;
+    in[2]=~0ull-7;
+    assert(owner.adoptQueue(in)==kIOReturnBadArgument);
+    in[2]=1024;
     owner.hangCall=false;
     assert(owner.adoptQueue(in)==kIOReturnNotReady && q.ringDw==256);
 }
