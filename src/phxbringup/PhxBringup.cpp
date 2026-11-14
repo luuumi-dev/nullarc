@@ -116,6 +116,7 @@ public:
     // user BOs are then mapped into the VMID 8 page table and SUBMIT writes INDIRECT_BUFFERs into the queue's ring.
     IOReturn adoptQueue(const uint64_t in[6]);
     IOReturn claimAccel();
+    bool vmHealthy() const { return !__atomic_load_n(&vmFaulted, __ATOMIC_ACQUIRE); }
     bool gpuReady() const { return gq[0].ready || gq[1].ready; }
     // one GPUVM context (VMID 8..15) per client process: RADV instances allocate VAs independently
     uint32_t vmidAlloc();
@@ -206,7 +207,8 @@ private:
     uint64_t *ptTable(const VmCtx &c, uint64_t phys) const;
     uint64_t ptTablePhys(VmCtx &c, uint32_t i);
     uint64_t *vmPte(VmCtx &c, uint64_t va, bool alloc);
-    void vmFlushTlb(uint32_t vmid) const;
+    bool vmFlushTlb(uint32_t vmid);
+    bool vmFaulted{false};
     void ringPut(GpuQueue &q, uint32_t idx, uint32_t value);
     thread_call_t hangCall{nullptr};
     volatile bool hangStop{false};
@@ -692,17 +694,24 @@ uint64_t *PhxBringup::vmPte(VmCtx &c, uint64_t va, bool alloc) {
     return t ? t + ((va >> 12) & 511) : nullptr;
 }
 
-void PhxBringup::vmFlushTlb(uint32_t vmid) const {
+bool PhxBringup::vmFlushTlb(uint32_t vmid) {
     __asm__ __volatile__("mfence" ::: "memory");
     wreg(kRegInvEng17Req, 0x00F80000u | (1u << vmid) | 1u);
-    for (int i = 0; i < 1000 && !(rreg(kRegInvEng17Ack) & (1u << vmid)); i++)
+    for (int i = 0; i < 1000; i++) {
+        const uint32_t ack = rreg(kRegInvEng17Ack);
+        if (ack != 0xFFFFFFFFu && (ack & (1u << vmid)))
+            return true;
         IODelay(1);
+    }
+    __atomic_store_n(&vmFaulted, true, __ATOMIC_RELEASE);
+    IOLog("PhxBringup: VMID %u TLB invalidation failed; retaining GPU resources until reboot\n", vmid);
+    return false;
 }
 
 // Takes a free context: empty tables (root only), no hardware VMID until its first submission. Returns its handle,
 // 0 when all kMaxCtx are in use.
 uint32_t PhxBringup::vmidAlloc() {
-    if (!gpuReady())
+    if (!gpuReady() || !vmHealthy())
         return 0;
     IOLockLock(gpuLock);
     for (uint32_t i = 0; i < kMaxCtx; i++) {
@@ -770,14 +779,15 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     wreg(kRegCtx0StartLo + 2 * vmid + 1, 0);
     wreg(kRegCtx0EndLo + 2 * vmid, 0xffffffff);
     wreg(kRegCtx0EndLo + 2 * vmid + 1, 0xf);
-    vmFlushTlb(vmid);
+    if (!vmFlushTlb(vmid))
+        return 0;
     return vmid;
 }
 
 // A timeout never licenses teardown: callers retain all resources until this succeeds.
 bool PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
     IOLockLock(gpuLock);
-    if (isStopped() || gpuRetiredLocked() < lastSeq) {
+    if (isStopped() || !vmHealthy() || gpuRetiredLocked() < lastSeq) {
         IOLockUnlock(gpuLock);
         return false;
     }
@@ -794,7 +804,10 @@ bool PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
             flushLine(p + o);
     }
     if (c.hw) {
-        vmFlushTlb(c.hw);
+        if (!vmFlushTlb(c.hw)) {
+            IOLockUnlock(gpuLock);
+            return false;
+        }
         hwv[c.hw - kFirstUserVmid].ctx = 0;
         c.hw = 0;
     }
@@ -805,7 +818,7 @@ bool PhxBringup::vmidFree(uint32_t handle, uint64_t lastSeq) {
 }
 
 IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
-    if (!fbAper || !doorbellMap || !mmio || !fbMcBase || !gpuLock || !hangCall)
+    if (!fbAper || !doorbellMap || !mmio || !fbMcBase || !gpuLock || !hangCall || !vmHealthy())
         return kIOReturnNotReady;
     // in[5] = fence offset | queue index (0 compute, 1 gfx): the fence is 8-byte aligned, so bit 0 is free
     const uint64_t ringOff = in[0], ringDw = in[1], wbOff = in[2], dbByte = in[3], wptr = in[4], fenceOff = in[5] & ~1ull;
@@ -856,7 +869,7 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
         !phxRangeFits(off, size, md->getLength()) || !phxRangeFits(va, size, 1ull << 48))
         return kIOReturnBadArgument;
     IOLockLock(gpuLock);
-    if (!vmCtx(handle)) {
+    if (!vmHealthy() || !vmCtx(handle)) {
         IOLockUnlock(gpuLock);
         return kIOReturnNotReady;
     }
@@ -888,17 +901,19 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
             }
         }
     }
-    if (c.hw)
-        vmFlushTlb(c.hw);
+    if (c.hw && !vmFlushTlb(c.hw))
+        r = kIOReturnTimeout;
     IOLockUnlock(gpuLock);
     return r;
 }
 
 IOReturn PhxBringup::vmUnmap(uint32_t handle, uint64_t va, uint64_t size) {
-    if (!vmCtx(handle))
-        return kIOReturnNotReady;
-    VmCtx &c = vm[handle - 1];
     IOLockLock(gpuLock);
+    if (!vmHealthy() || !vmCtx(handle)) {
+        IOLockUnlock(gpuLock);
+        return kIOReturnNotReady;
+    }
+    VmCtx &c = vm[handle - 1];
     for (uint64_t p = 0; p < size; p += 4096) {
         uint64_t *pte = vmPte(c, va + p, false);
         if (pte) {
@@ -906,10 +921,9 @@ IOReturn PhxBringup::vmUnmap(uint32_t handle, uint64_t va, uint64_t size) {
             flushLine(pte);
         }
     }
-    if (c.hw)
-        vmFlushTlb(c.hw);
+    const bool flushed = !c.hw || vmFlushTlb(c.hw);
     IOLockUnlock(gpuLock);
-    return kIOReturnSuccess;
+    return flushed ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
 void PhxBringup::ringPut(GpuQueue &q, uint32_t idx, uint32_t value) {
@@ -949,7 +963,7 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     IOLockLock(gpuLock);
     // graphics IBs go to the gfx queue and compute IBs to the compute queue; with one of them missing, the other runs both
     GpuQueue *qp = gfx ? (gq[1].ready ? &gq[1] : &gq[0]) : (gq[0].ready ? &gq[0] : &gq[1]);
-    if (!qp->ready || !vmCtx(handle)) {
+    if (!vmHealthy() || !qp->ready || !vmCtx(handle)) {
         IOLockUnlock(gpuLock);
         return kIOReturnNotReady;
     }
@@ -1793,6 +1807,8 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
 
 // Called under the client lock, so no later submission can race resource teardown.
 bool IOAccelPhxNativeClient::waitIdle() {
+    if (!owner->vmHealthy())
+        return false;
     if (!lastSeq)
         return true;
     for (unsigned i = 0; i < 5000; i++) {
@@ -1815,8 +1831,11 @@ IOReturn IOAccelPhxNativeClient::doBoFree(IOExternalMethodArguments *a) {
     retireFences(owner->gpuRetired());
     for (int i = 0; i < kMaxMaps; i++)
         if (maps[i].used && maps[i].handle == h) {
-            if (vmid && owner)
-                owner->vmUnmap(vmid, maps[i].va, maps[i].size);
+            if (vmid && owner) {
+                const IOReturn r = owner->vmUnmap(vmid, maps[i].va, maps[i].size);
+                if (r != kIOReturnSuccess)
+                    return r;
+            }
             maps[i].used = false;
         }
     if (b->host)
@@ -1917,7 +1936,8 @@ IOReturn IOAccelPhxNativeClient::doGemVa(IOExternalMethodArguments *a) {
         if (owner->gpuReady()) {
             const IOReturn r = ensureVmid() ? owner->vmMap(vmid, va, b->md, v->offset_in_bo, v->map_size) : kIOReturnNoResources;
             if (r != kIOReturnSuccess) {
-                maps[freei].used = false;
+                if (r != kIOReturnTimeout)
+                    maps[freei].used = false;
                 return r;
             }
         }
@@ -1927,9 +1947,12 @@ IOReturn IOAccelPhxNativeClient::doGemVa(IOExternalMethodArguments *a) {
         if (maps[i].used && maps[i].handle == v->handle && maps[i].va == va && maps[i].size == v->map_size) {
             if (!waitIdle())
                 return kIOReturnBusy;
+            if (vmid) {
+                const IOReturn r = owner->vmUnmap(vmid, va, v->map_size);
+                if (r != kIOReturnSuccess)
+                    return r;
+            }
             maps[i].used = false;
-            if (vmid)
-                owner->vmUnmap(vmid, va, v->map_size);
             return kIOReturnSuccess;
         }
     }

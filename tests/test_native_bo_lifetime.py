@@ -35,7 +35,10 @@ struct Owner {
     uint64_t retired=0, after=~0ull;
     unsigned unmaps=0;
     uint64_t gpuRetired() { return sleeps >= after ? 7 : retired; }
-    void vmUnmap(uint32_t, uint64_t, uint64_t) { unmaps++; }
+    bool healthy=true;
+    bool vmHealthy() const { return healthy; }
+    int unmapError=0;
+    int vmUnmap(uint32_t, uint64_t, uint64_t) { unmaps++; return unmapError; }
 };
 struct IOAccelPhxNativeClient {
     struct Bo { bool host=false; uint32_t domain=2, bits=0; uint64_t size=8; bool live=true; } bo;
@@ -67,9 +70,16 @@ int main() {
     assert(!client.bo.live && !client.maps[0].used && client.gttUsed==0);
     assert(client.releases==1 && owner.unmaps==1 && client.fences==1);
     assert(client.doBoFree(&args)==kIOReturnNotFound);
+    owner.healthy=false;
+    assert(!client.waitIdle());
+    owner.healthy=true;
     client.lastSeq=0;
     unsigned before=sleeps;
     assert(client.waitIdle() && sleeps==before);
+    IOAccelPhxNativeClient failed; failed.owner=&owner;
+    owner.unmapError=4;
+    assert(failed.doBoFree(&args)==4 && failed.bo.live && failed.maps[0].used);
+    assert(failed.gttUsed==8 && !failed.releases);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,10 +193,11 @@ struct PhxBringup {
     uint64_t retired=0;
     bool stopped=false;
     bool isStopped() const { return stopped; }
+    bool vmHealthy() const { return true; }
     unsigned tlb=0;
     uint64_t gpuRetiredLocked() const { assert(gpuLock->held); return retired; }
     VmCtx *vmCtx(uint32_t handle) { return handle==1 && vm[0].busy ? vm : nullptr; }
-    void vmFlushTlb(uint32_t) { assert(gpuLock->held); tlb++; }
+    bool vmFlushTlb(uint32_t) { assert(gpuLock->held); tlb++; return true; }
     bool vmidFree(uint32_t, uint64_t);
 };
 '''
@@ -241,6 +252,7 @@ struct PhxBringup {
     Memory *fbAper=&memory, *doorbellMap=&doorbell, *mmio=&memory;
     uint64_t fbMcBase=1, fbAperLen=4096, gSeq=7;
     bool hangCall=true;
+    bool vmHealthy() const { return true; }
     Lock mutex; Lock *gpuLock=&mutex;
     GpuQueue gq[2]{};
     void hdpFlush() {}

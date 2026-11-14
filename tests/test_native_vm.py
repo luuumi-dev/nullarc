@@ -19,7 +19,7 @@ class NativeVmTest(unittest.TestCase):
 using IOReturn=int; using IOByteCount=uint64_t; using addr64_t=uint64_t;
 constexpr int kIOReturnSuccess=0, kIOReturnBadArgument=1, kIOReturnNotReady=2;
 constexpr int kIOReturnVMError=3, kIOReturnNoMemory=4, kIOReturnNotFound=5;
-constexpr int kIOReturnUnsupported=6, kIOReturnNoResources=7, kIOReturnBusy=8;
+constexpr int kIOReturnUnsupported=6, kIOReturnNoResources=7, kIOReturnBusy=8, kIOReturnTimeout=9;
 constexpr int kIOMemoryMapperNone=0, kMaxMaps=1;
 constexpr uint64_t kPtAddrMask=0x0000fffffffff000ull, kPteSysFlags=0x77;
 constexpr uint64_t kVaMask=(1ull<<48)-1;
@@ -48,9 +48,11 @@ struct PhxBringup {
         unsigned index=(va-0x10000)/4096; assert(index<2);
         return allocate && index==static_cast<unsigned>(failPte) ? nullptr : ptes+index;
     }
-    void vmFlushTlb(unsigned) { assert(gpuLock->held); tlbs++; }
+    bool flushOk=true, healthy=true;
+    bool vmHealthy() const { return healthy; }
+    bool vmFlushTlb(unsigned) { assert(gpuLock->held); tlbs++; return flushOk; }
     bool gpuReady() { return true; }
-    IOReturn vmUnmap(uint32_t, uint64_t, uint64_t) { return 0; }
+    IOReturn vmUnmap(uint32_t, uint64_t, uint64_t);
     IOReturn vmMap(uint32_t, uint64_t, IOMemoryDescriptor *, uint64_t, uint64_t);
 };
 struct IOExternalMethodArguments { void *structureInput; };
@@ -70,6 +72,7 @@ struct IOAccelPhxNativeClient {
 '''
         code += method(source, 'static bool vaCanonical(')
         code += method(source, 'IOReturn PhxBringup::vmMap(')
+        code += method(source, 'IOReturn PhxBringup::vmUnmap(')
         code += method(source, 'IOReturn IOAccelPhxNativeClient::doGemVa(')
         code += r'''
 int main() {
@@ -107,6 +110,17 @@ int main() {
     md.failPage=-1;
     assert(client.doGemVa(&args)==0 && client.maps[0].used);
     assert(owner.ptes[0] && owner.ptes[1] && !owner.gpuLock->held);
+    input.operation=PHX_AMDGPU_VA_OP_UNMAP;
+    owner.flushOk=false;
+    assert(client.doGemVa(&args)==kIOReturnTimeout && client.maps[0].used);
+    owner.flushOk=true;
+    assert(client.doGemVa(&args)==0 && !client.maps[0].used);
+    input.operation=PHX_AMDGPU_VA_OP_MAP;
+    owner.flushOk=false;
+    assert(client.doGemVa(&args)==kIOReturnTimeout && client.maps[0].used);
+    owner.healthy=false;
+    reads=md.reads;
+    assert(owner.vmMap(1,0x10000,&md,0,8192)==kIOReturnNotReady && md.reads==reads);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +128,45 @@ int main() {
             (path / 'test.cpp').write_text(code)
             subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                             '-fsanitize=address,undefined', '-I' + str(ROOT / 'src'),
+                            str(path / 'test.cpp'), '-o', str(path / 'test')], check=True)
+            subprocess.run([str(path / 'test')], check=True)
+
+    def test_tlb_ack_timeout_and_unavailable_mmio(self):
+        source = (ROOT / 'src/phxbringup/PhxBringup.cpp').read_text()
+        code = r'''
+#include <cassert>
+#include <cstdint>
+constexpr uint32_t kRegInvEng17Req=1, kRegInvEng17Ack=2;
+unsigned delays=0;
+void IODelay(unsigned) { delays++; }
+template<class... T> void IOLog(const char *,T...) {}
+struct PhxBringup {
+    bool vmFaulted=false;
+    unsigned reads=0, successAfter=0;
+    uint32_t reply=1u<<8, request=0;
+    void wreg(uint32_t reg, uint32_t value) { assert(reg==1); request=value; }
+    uint32_t rreg(uint32_t reg) { assert(reg==2); return reads++ >= successAfter ? reply : 0; }
+    bool vmFlushTlb(uint32_t);
+};
+'''
+        code += method(source, 'bool PhxBringup::vmFlushTlb(')
+        code += r'''
+int main() {
+    PhxBringup owner;
+    assert(owner.vmFlushTlb(8) && !owner.vmFaulted && !delays);
+    assert(owner.request==(0x00F80000u|(1u<<8)|1u));
+    owner.reads=0; owner.successAfter=3;
+    assert(owner.vmFlushTlb(8) && !owner.vmFaulted && delays==3);
+    owner.reads=0; owner.successAfter=1001; delays=0;
+    assert(!owner.vmFlushTlb(8) && owner.vmFaulted && delays==1000);
+    owner.vmFaulted=false; owner.successAfter=0; owner.reply=~0u; delays=0;
+    assert(!owner.vmFlushTlb(8) && owner.vmFaulted && delays==1000);
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp)
+            (path / 'test.cpp').write_text(code)
+            subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                             str(path / 'test.cpp'), '-o', str(path / 'test')], check=True)
             subprocess.run([str(path / 'test')], check=True)
 
