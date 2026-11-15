@@ -1,6 +1,6 @@
 //
-//  rdna3_rebar_uma.h — Memory aperture planner and ReBAR logic for Phoenix APU (780M).
-//  Freestanding pure C++17 logic, host-testable under ASan/UBSan.
+//  rdna3_rebar_uma.h — Memory aperture planner for RDNA 3 APUs (Phoenix UMA carve-out) and discrete GPUs
+//  (dedicated VRAM behind BAR0/ReBAR). Freestanding pure C++17 logic, host-testable under ASan/UBSan.
 //
 #pragma once
 #include <stdint.h>
@@ -31,6 +31,7 @@ enum class RebarStatus : uint32_t {
     ConsoleBeyondLimit,
     ConsoleOverlap,
     MapCapZero,
+    PoolFloorBeyondLimit,
 };
 
 const char *rebar_status_name(RebarStatus s);
@@ -68,7 +69,12 @@ struct MemoryPlanOutput {
     uint64_t    aperture_pts[3];   // 3 verification test points (base, mid, top)
 };
 
-// Pure calculation of memory layout, verified for Phoenix APU.
+// Pure calculation of the memory layout.
+//   APU  (is_apu = true):  the carve-out is UMA; CPU sees it through BAR0 exactly like the firmware does and the
+//                          scanout reserve starts the visible pool.
+//   dGPU (is_apu = false): VRAM is dedicated. The firmware/GOP console usually sits at VRAM offset 0 and must stay
+//                          outside the allocator, so the visible pool starts after it. Everything above the BAR0
+//                          window (map_len) is a CPU-invisible high pool that can only be reached by GPUVM.
 MemoryPlanOutput plan_memory_aperture(const MemoryPlanInput &in);
 
 } // namespace rdna3

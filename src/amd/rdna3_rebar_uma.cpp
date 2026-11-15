@@ -19,6 +19,7 @@ const char *rebar_status_name(RebarStatus s) {
     case RebarStatus::ConsoleBeyondLimit: return "Console extends beyond VRAM limit";
     case RebarStatus::ConsoleOverlap: return "Console overlaps reserved allocation regions";
     case RebarStatus::MapCapZero: return "Mapping cap is 0";
+    case RebarStatus::PoolFloorBeyondLimit: return "Scanout/console reserve leaves no visible VRAM pool";
     default: return "Unknown";
     }
 }
@@ -93,14 +94,24 @@ MemoryPlanOutput plan_memory_aperture(const MemoryPlanInput &in) {
     out.map_len    = map_len;
     out.vram_limit = vram_limit;
 
-    // Allocator pools:
-    // Visible pool starts above scanout reserve (or at scanout reserve)
-    out.vis_pool_base = in.scanout_reserve;
-    if (vram_limit > out.vis_pool_base) {
-        out.vis_pool_size = vram_limit - out.vis_pool_base;
-    } else {
-        out.vis_pool_size = 0;
+    // Allocator pools. The visible pool must never contain memory that is already in use:
+    //  - APU: the DCN scanout reserve, which also hosts the firmware framebuffer;
+    //  - dGPU: that reserve plus the firmware/GOP console, which sits wherever the VBIOS placed it inside the BAR
+    //    window (VRAM offset 0 when the card is the boot GPU). The kext hands it to IOFramebuffer as the initial
+    //    surface, so the allocator has to start above it.
+    uint64_t pool_floor = in.scanout_reserve;
+    if (!in.is_apu && in.console_off != ~0ull && in.console_len > 0) {
+        const uint64_t console_end =
+            (in.console_off + in.console_len + (kPageTableAlign - 1ull)) & ~(kPageTableAlign - 1ull);
+        if (console_end > pool_floor)
+            pool_floor = console_end;
     }
+    if (pool_floor >= vram_limit) {
+        out.status = RebarStatus::PoolFloorBeyondLimit;
+        return out;
+    }
+    out.vis_pool_base = pool_floor;
+    out.vis_pool_size = vram_limit - pool_floor;
 
     // High pool exists if usable VRAM extends beyond vram_limit
     if (usable_vram > vram_limit) {
