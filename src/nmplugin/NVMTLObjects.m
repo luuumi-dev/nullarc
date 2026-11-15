@@ -5181,6 +5181,26 @@ static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb) {
     static int each = -1; if (each < 0) { const char *e = getenv("NVMTL_DEBUG_WAIT_EACH"); each = e && e[0] == '1'; }
     if (each) { static _Atomic unsigned long n; const unsigned long k = ++n; nvtrace("CB commit #%lu %s", k, _label.UTF8String ?: "");
         [self waitUntilCompleted]; nvtrace("CB done #%lu status %ld", k, (long)self.status); }
+    // A command buffer that writes an IOSurface is finished before commit returns (applications other than
+    // WindowServer). Surfaces the GPU cannot use in place are private images: their pixels reach the IOSurface's
+    // memory in a CPU copy when the command buffer completes (surface-out), and the next user of the surface uploads
+    // that memory when it binds it (surface-in), in the same process or another. With the commit carried out later on
+    // the execution worker the reader took the memory before or in the middle of that copy: Tencent Meeting's camera
+    // preview (planes handed from one stage to the next) broke up into blocks that changed every frame, and was clean
+    // with NVMTL_ASYNC_COMMIT=0 or with every command buffer waited for (2026-11-15). Waiting only until the work was
+    // scheduled did not help. The wait is for the execution and the copy, not for the completion handlers (a commit
+    // made inside a handler would wait for itself), and not on the worker. NVMTL_NO_SURFACE_COMMIT_WAIT=1 turns it off.
+    static int surfWait = -1;
+    if (surfWait < 0) { surfWait = !getenv("NVMTL_NO_SURFACE_COMMIT_WAIT") && !(getprogname() && !strcmp(getprogname(), "WindowServer"));
+        nvlog("commit: a command buffer that writes an IOSurface is finished before commit returns: %s", surfWait ? "on" : "off"); }
+    if (surfWait && !each && nvmtl_cb_writes_surfaces(self)) {
+        const char *q = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+        if (!q || strcmp(q, "nvmtl.execution")) {
+            [_completionCondition lock];
+            while (!_completionReady) [_completionCondition wait];
+            [_completionCondition unlock];
+        }
+    }
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
