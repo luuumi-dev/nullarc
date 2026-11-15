@@ -43,6 +43,10 @@ Measured on the reference machine — Firebat U6C, AMD Ryzen 7 7840HS / H 255, R
 | **Hardware Support** | Unified | Dynamic topology engine supports Radeon 780M (12 CUs), 760M (8 CUs), and 740M (4 CUs) via selector 30. |
 | **Not yet** | WIP | External display PHYs (HDMI / Type-C DP via DCN 3.1.4 in progress), hardware VCN 4.0.2 video decode. |
 
+Discrete RDNA 3 cards (Navi 31/32/33) are **not supported yet**. What it takes, per subsystem, is analysed
+in **[docs/dgpu-support.md](docs/dgpu-support.md)** with a staged plan and a read-only capture tool
+([tools/linux-dgpu](tools/linux-dgpu)).
+
 Known bugs, architecture notes, and progress are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) and [BUGS.md](BUGS.md).
 
 ## How it works
@@ -102,6 +106,7 @@ The test runner validates:
 4. `test_r3n_abi`: UserClient ABI handshake, BO allocation, PM4 CS submission
 5. `test_phx_topology`: 128-byte wire topology and CU/RB masks for 780M, 760M, and 740M
 6. `test_wait_seq`: Non-spinning adaptive wait queues, timeout clamping, and fence retirement
+7. `test_rdna3_dgpu`: APU/dGPU classification from IP discovery and the dedicated-VRAM memory plan
 
 ## Notable Fixes
 
