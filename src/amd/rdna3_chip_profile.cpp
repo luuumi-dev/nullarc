@@ -5,6 +5,64 @@
 
 namespace rdna3 {
 
+const char *chip_family_name(ChipFamily f) {
+    switch (f) {
+    case ChipFamily::Phoenix1: return "Phoenix";
+    case ChipFamily::Phoenix2: return "Phoenix 2";
+    case ChipFamily::Navi31:   return "Navi 31";
+    case ChipFamily::Navi32:   return "Navi 32";
+    case ChipFamily::Navi33:   return "Navi 33";
+    default:                   return "unknown";
+    }
+}
+
+bool chip_is_apu(ChipFamily f) {
+    return f == ChipFamily::Phoenix1 || f == ChipFamily::Phoenix2;
+}
+
+ChipIdentity chip_identity(const IpDiscoveryParser &disc) {
+    ChipIdentity id = {};
+    id.family = ChipFamily::Unknown;
+    id.kind = ChipKind::Discrete;
+    if (!disc.is_valid())
+        return id;
+
+    IpEntry e;
+    if (!disc.find_ip(HwId::Gc, 0, e))
+        return id;
+    id.gc.major = e.major;
+    id.gc.minor = e.minor;
+    id.gc.revision = e.revision;
+    if (disc.find_ip(HwId::Mp0, 0, e)) {
+        id.mp0.major = e.major;
+        id.mp0.minor = e.minor;
+        id.mp0.revision = e.revision;
+    }
+    if (disc.find_ip(HwId::Mp1, 0, e)) {
+        id.mp1.major = e.major;
+        id.mp1.minor = e.minor;
+        id.mp1.revision = e.revision;
+    }
+    id.has_display = disc.find_ip(HwId::Dmu, 0, e);
+
+    // GC 11.0.x only: RDNA 3. The revision is the part number, not a stepping (Mesa ac_gpu_info.c:
+    // GFX11 family 11.0 -> gfx1100 Navi 31, gfx1101 Navi 32, gfx1102 Navi 33, gfx1103 Phoenix).
+    if (id.gc.major != 11 || id.gc.minor != 0)
+        return id;
+    switch (id.gc.revision) {
+    case 0: id.family = ChipFamily::Navi31;   id.kind = ChipKind::Discrete; break;
+    case 1: id.family = ChipFamily::Phoenix1; id.kind = ChipKind::Apu;      break;
+    case 2: id.family = ChipFamily::Navi33;   id.kind = ChipKind::Discrete; break;
+    case 3: id.family = ChipFamily::Navi32;   id.kind = ChipKind::Discrete; break;
+    case 4: id.family = ChipFamily::Phoenix2; id.kind = ChipKind::Apu;      break;
+    default:
+        // A revision this table has never seen: keep Unknown and Discrete so that a caller logs the part and
+        // programs nothing (kind Discrete is the conservative answer: no UMA shortcuts are taken).
+        return id;
+    }
+    return id;
+}
+
 namespace {
 
 constexpr ChipProfile kProfiles[] = {
@@ -73,6 +131,10 @@ const ChipProfile *chip_profile(const IpDiscoveryParser &disc) {
 }
 
 bool chip_regs(const IpDiscoveryParser &disc, const ChipProfile &prof, ChipRegs &r) {
+    // A row whose offsets have not been confirmed against a capture of the real card must never drive register
+    // writes: it exists for identification and planning only (docs/dgpu-support.md, stage 1).
+    if (!prof.regs_verified)
+        return false;
     const uint8_t ps = prof.psp_mbox_base_idx, ss = prof.smu_mbox_base_idx;
     return reg(disc, HwId::Mp0, ps, kMp0C2pmsg58, r.psp_c2pmsg_58) &&
            reg(disc, HwId::Mp0, ps, kMp0C2pmsg64, r.psp_c2pmsg_64) &&
@@ -97,7 +159,7 @@ bool fw_prefix(const IpDiscoveryParser &disc, HwId hw, char *out, size_t out_len
     case HwId::Gc: ip = "gc"; break;
     case HwId::Mp0: ip = "psp"; break;
     case HwId::Sdma0: ip = "sdma"; break;
-    case HwId::Vcn: ip = "vcn"; break;
+    // VCN has no HwId here yet: the video path is out of scope for dGPU stage 1 (docs/dgpu-support.md).
     default: return false;
     }
     IpEntry e;
