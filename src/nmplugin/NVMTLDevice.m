@@ -821,6 +821,14 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
 }
+// CAMetalLayer's allocate_drawable_texture sets the descriptor's private isDrawable before it wraps a drawable's surface.
+// Without it on the texture, CoreImage rendered Photo Booth's preview into the drawable bottom row first: upside down.
+static BOOL nvmtl_desc_drawable(MTLTextureDescriptor *d) {
+    SEL s = sel_registerName("isDrawable");
+    BOOL r = d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
+    static int said; if (r && !said++) nvlog("drawable texture: the descriptor says isDrawable, the texture answers YES (CoreImage flips for it)");
+    return r;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -836,6 +844,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
     t->_fbo = nvmtl_desc_fbo(d);
+    t->_drawable = nvmtl_desc_drawable(d);
     t->_fmt = d.pixelFormat;
     uint32_t dvk = 0, dasp = 0;
     if (nvmtl_depthfmt(d.pixelFormat, &dvk, &dasp) == 0) {
@@ -1008,6 +1017,7 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
     t->_fbo = nvmtl_desc_fbo(d);
+    t->_drawable = nvmtl_desc_drawable(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
@@ -1020,7 +1030,7 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     if (backing && !backing->_vramOn) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = t->_drawable;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
         }
