@@ -1010,6 +1010,28 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     t->_fbo = nvmtl_desc_fbo(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
+    // MTLTextureUsageUnknown means "every use": Apple's drivers hand such a texture back with usage Unknown and any
+    // caller may render to it or write it from a shader. Here it was created read/render-only and -usage answered
+    // ShaderRead, so CoreImage refused it as a destination ("-[CIRenderDestination initWithMTLTexture:commandBuffer:]
+    // texture usage must include MTLTextureUsageShaderWrite", then "The destination is nil" on every frame): Photo
+    // Booth's preview, an Unknown-usage BGRA8 surface from AppleMetalOpenGLRenderer, stayed black. An app's
+    // Unknown-usage surface texture is now created for every use its format allows and says so.
+    // WindowServer keeps its descriptors as they are. NVMTL_NO_SURF_UNKNOWN=1 restores the old behaviour.
+    {
+        extern int nvmtl_vk_format_is_storage(uint32_t vkf);
+        static int promote = -1;
+        if (promote < 0) { const char *me = getprogname();
+            promote = !getenv("NVMTL_NO_SURF_UNKNOWN") && !(me && !strcmp(me, "WindowServer"));
+            nvlog("surface textures: usage Unknown promoted to every use %s", promote ? "ON" : "OFF"); }
+        // One plane only, to keep this narrow: the planes of a camera frame (420v) arrive with usage Unknown too, are
+        // only read, and a writable wrapper of a multi-plane surface is a private image that gets copied back.
+        if (promote && surf && d.usage == MTLTextureUsageUnknown && IOSurfaceGetPlaneCount(surf) <= 1) {
+            MTLTextureDescriptor *pd = [d copy];
+            pd.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView
+                     | ((!a8 && nvmtl_vk_format_is_storage(vkf)) ? MTLTextureUsageShaderWrite : 0);
+            d = pd;
+        }
+    }
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
