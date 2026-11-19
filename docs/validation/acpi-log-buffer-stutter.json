@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-19",
+  "scope": "finite local firmware treatment; current upstream main not hardware-tested",
+  "OS_version": "26.7.2",
+  "OS_build": "25G332",
+  "GPU": "Radeon 780M / gfx1103 / PCI 1002:1900",
+  "runtime_kernel_build": 34,
+  "downstream_runtime_source": "1d4968fbc2ce988c77bdd85b2ec36f435b57f496",
+  "downstream_active_VBL_source": "439f8a5bc3e086770df7b576897fbb11d7ccc9f1",
+  "intervention": {
+    "ACPI_log_buffer_bulk_copy": true,
+    "kernel_plugin_and_selected_cache_changed": false,
+    "query_sleep_acknowledgment_power_limit_code_changed": false,
+    "exact_original_method_body_and_callsite_preserved": true
+  },
+  "diagnostic_observations": {
+    "queue_dispatches_matched": 372,
+    "queue_delays_over80ms": 105,
+    "maximum_queue_delay_ms": 466.238,
+    "matched_Mach_timer_delay_range_ms": [
+      132.237,
+      202.174
+    ],
+    "minimum_nonblocked_query_union_queue_window_coverage_percent": 99.327,
+    "guarded_query_on_CPU_samples": 406,
+    "byte_move_method_samples": 395,
+    "byte_move_share_percent": 97.290640394,
+    "probe_errors": 0,
+    "reported_drops": 0,
+    "blocked_worker_compensation_observed": true
+  },
+  "offline_validation": {
+    "actual_AML_equivalence_cases": 28,
+    "strict_and_slack_return_behavior_compared": true,
+    "mock_OperationRegions": 0,
+    "exact_table_guard_cases": 13,
+    "activation_CPU_checks": 45
+  },
+  "GUI_control": {
+    "Launch_Services": true,
+    "nice": 0,
+    "observed_dynamic_priority": 46,
+    "elapsed_s": 16.199645431,
+    "GUI": {
+      "n": 599,
+      "median_ms": 16.671068000000176,
+      "p95_ms": 18.304482999999983,
+      "p99_ms": 296.976576,
+      "max_ms": 512.5522270000005,
+      "over33ms": 22,
+      "over100ms": 19
+    },
+    "worker": {
+      "n": 1427,
+      "median_ms": 10.881965999999466,
+      "p95_ms": 14.273400000000436,
+      "p99_ms": 14.840704000000926,
+      "max_ms": 16.17463699999999,
+      "over33ms": 0,
+      "over100ms": 0
+    }
+  },
+  "candidate_GUI_observations": [
+    {
+      "label": "early",
+      "uptime_before_seconds": 620.9044840335846,
+      "elapsed_s": 16.010801025,
+      "GUI": {
+        "n": 942,
+        "median_ms": 16.666514999999826,
+        "p95_ms": 17.839681999999968,
+        "p99_ms": 18.511891999999364,
+        "max_ms": 21.89517000000052,
+        "over33ms": 0,
+        "over100ms": 0
+      },
+      "worker": {
+        "n": 1409,
+        "median_ms": 10.92263300000007,
+        "p95_ms": 14.29911900000036,
+        "p99_ms": 14.821327000000828,
+        "max_ms": 15.264226999999408,
+        "over33ms": 0,
+        "over100ms": 0
+      },
+      "onscreen_checks": 15,
+      "VBL_plateaus_over80ms": 0
+    },
+    {
+      "label": "delayed",
+      "uptime_before_seconds": 914.9182000160217,
+      "elapsed_s": 16.038057820000002,
+      "GUI": {
+        "n": 942,
+        "median_ms": 16.679483499999925,
+        "p95_ms": 17.81990599999972,
+        "p99_ms": 18.73001999999957,
+        "max_ms": 33.09912100000001,
+        "over33ms": 0,
+        "over100ms": 0
+      },
+      "worker": {
+        "n": 1411,
+        "median_ms": 10.89404000000016,
+        "p95_ms": 14.431998000000945,
+        "p99_ms": 14.800399000000297,
+        "max_ms": 15.429185999999984,
+        "over33ms": 0,
+        "over100ms": 0
+      },
+      "onscreen_checks": 15,
+      "VBL_plateaus_over80ms": 0
+    }
+  ],
+  "timer_control": {
+    "earlier_original_ACPI_boot": true,
+    "same_program_and_Launch_Services": true,
+    "elapsed_ms": 20056.859881,
+    "Mach_port_timer_lateness": {
+      "n": 1149,
+      "median_ms": 0.022905,
+      "p99_ms": 291.284147,
+      "max_ms": 521.591188,
+      "over80ms": 31
+    },
+    "direct_wait_thread_intervals": {
+      "n": 1804,
+      "median_ms": 10.688764,
+      "p99_ms": 14.725177,
+      "max_ms": 14.994663,
+      "over80ms": 0
+    }
+  },
+  "candidate_timer": {
+    "elapsed_ms": 20009.903679,
+    "timer_errors": 0,
+    "timer_destroyed": true,
+    "launched_via_LaunchServices": true,
+    "process_scheduling": {
+      "nice": 0,
+      "priority": 37,
+      "state": "S"
+    },
+    "critical_zero_leeway": true,
+    "requested_period_ms": 10,
+    "Mach_port_timer_lateness": {
+      "n": 1972,
+      "median_ms": 0.041302,
+      "p99_ms": 0.71802,
+      "max_ms": 11.457972,
+      "over80ms": 0
+    },
+    "direct_wait_thread_intervals": {
+      "n": 1758,
+      "median_ms": 10.919438,
+      "p99_ms": 14.721,
+      "max_ms": 15.626777,
+      "over80ms": 0
+    },
+    "explicit_GPU_submissions": 0
+  },
+  "integrity": {
+    "exact_loaded_DSDT_SSDT_verified": true,
+    "unrelated_loaded_table_bytes_verified": true,
+    "current_boot_accelerated_startup_passed": true,
+    "full_EFI_recovery_verified": true,
+    "full_selected_cache_metadata_verified": true,
+    "combined_cache_records": 416,
+    "codeless_cache_records": 29,
+    "unrelated_images_preserved_against_earlier_baseline": 415,
+    "final_independent_readback_passed": true,
+    "same_current_boot_WindowServer": true,
+    "new_driver_errors": 0,
+    "new_matching_reports": 0
+  },
+  "failed_observation": {
+    "root_only_output_parent_prevented_GUI_write": true,
+    "no_timing_result": true,
+    "failed_job_removed": true,
+    "new_output_scope_and_actual_user_permissions_checked": true
+  },
+  "assessment": {
+    "collection_passed": true,
+    "candidate_Mach_timer_no_deliveries_over80ms": true,
+    "cross_boot_comparison": true,
+    "controlled_same_boot_ABA": false,
+    "first_buffer_fill_time_observed": false,
+    "all_GUI_causes_proved": false,
+    "sustained_ordinary_workload_stability_accepted": false,
+    "physical_scanout_FPS_measured": false,
+    "direct_mouse_input_latency_measured": false,
+    "both_GUI_samples_no_intervals_over33_34ms": true,
+    "inherited_GUI_over33ms_field_threshold_ms": 33.34
+  },
+  "private_material_excluded": [
+    "firmware tables and disassembly",
+    "personal OpenCore configuration and exact patch bytes",
+    "compiled SSDT and driver binaries",
+    "raw traces, kernel addresses and diagnostic archives",
+    "serials, UUIDs and ROM values"
+  ]
+}
