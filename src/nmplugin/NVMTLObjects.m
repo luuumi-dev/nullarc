@@ -5175,6 +5175,13 @@ static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb) {
     else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
+static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb) {
+    for (NVMTLSubmissionPart *part in cb->_parts) {
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in part->surfaces) if (t->_surf) return YES;
+    }
+    return NO;
+}
 - (void)commit {
     [self nvmtlSubmitWithEvents];
     // NVMTL_DEBUG_WAIT_EACH=1: every command buffer is waited for and its completion traced, so a GPU hang is pinned to
@@ -5182,6 +5189,7 @@ static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb) {
     static int each = -1; if (each < 0) { const char *e = getenv("NVMTL_DEBUG_WAIT_EACH"); each = e && e[0] == '1'; }
     if (each) { static _Atomic unsigned long n; const unsigned long k = ++n; nvtrace("CB commit #%lu %s", k, _label.UTF8String ?: "");
         [self waitUntilCompleted]; nvtrace("CB done #%lu status %ld", k, (long)self.status); }
+    if (!each) (void)nvmtl_surface_commit_wait(self);
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;

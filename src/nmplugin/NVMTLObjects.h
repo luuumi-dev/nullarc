@@ -133,6 +133,7 @@ extern id gNVMTLMainDevice;
   id _reservation;
   NSCondition *_completionCondition;
   dispatch_group_t _callbackGroup, _scheduledGroup;
+  dispatch_group_t _surfaceCommitGroup; // optional publication barrier; excludes handlers
   BOOL _wasScheduled, _executionDone, _completionReady, _scheduleAfterPublish;
   NSMutableArray *_signals;
   NSMutableArray *_waits;

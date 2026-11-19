@@ -82,3 +82,7 @@ kext:
 
 clean:
 	rm -rf build/
+
+.PHONY: test-nmplugin-surface-commit-wait
+test-nmplugin-surface-commit-wait: | $(TEST_BIN_DIR)
+	python3 tests/test_nmplugin_surface_commit_wait.py
