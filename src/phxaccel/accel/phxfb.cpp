@@ -22,6 +22,7 @@
 #include <sys/sysctl.h>
 #include "nvrm_vram_abi.h"
 #include "nvrm_gpuva_abi.h"
+#include "phx_panel_timing.h"
 
 void phxAgdcInstall();   // phxagdc.cpp: the AppleGraphicsDeviceControl that reports this panel (debug.phxagdc)
 void phxAgdcRemove();
@@ -105,6 +106,8 @@ private:
     static constexpr uint64_t kFrameNs = 16666667ull;   // 60 Hz, when the refresh cannot be measured
     uint64_t fFrameNs = kFrameNs;
     uint32_t fRefreshMilliHz = 60000, fHTotal = 0, fVTotal = 0;
+    phx::PanelTiming fPanelTiming = {};
+    bool fPanelTimingValid = false;
     static constexpr unsigned kBootHoldSec = 120;   // the boot daemon releases it sooner (debug.phxfb_hold=0)
     // The accelerator is NullMoth's, written against an NVIDIA RM: it backs each IOAccel surface with "VRAM" from the
     // framebuffer (nvAllocVram) and a GPU address from the RM (nvGpuVaAlloc/Map). On the 780M nothing on the GPU reads
@@ -263,15 +266,19 @@ private:
     // The firmware lit the panel at its native refresh, which the VBL timer and the mode must report: they said 60 Hz while
     // the panel scanned at 120 (OTG frame counter: 392 frames in 3.28 s), and WindowServer composited at 60 fps (2026-10-20).
     // Read-only: OTG0's H/V totals (DCN 3.1.4: segment 2 base 0x34c0 + 0x1b2a / 0x1b2f) and its frame counter (+0x1b4c)
-    // over ~200 ms, snapped to a standard rate when within 2 %.
+    // over ~2 s, snapped to a standard rate when within 2 %.
+    // A one-frame endpoint difference at 120 Hz is about 4.2 % over 200 ms,
+    // versus 0.42 % over 2 s. Use the actual elapsed time after sleeping.
     void measureRefresh() {
         IOMemoryMap *mm = fPCI ? fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5) : nullptr;
         if (!mm || mm->getLength() < 0x5100u * 4) { OSSafeReleaseNULL(mm); PFBLOG("refresh: no MMIO view, 60 Hz assumed"); return; }
-        volatile uint32_t *r = (volatile uint32_t *)mm->getVirtualAddress();
+        const volatile uint32_t *r = (const volatile uint32_t *)mm->getVirtualAddress();
+        const auto timingBefore = phx::readOtgTiming(r);
         const uint32_t ctl = r[0x34c0 + 0x1b41], ht = r[0x34c0 + 0x1b2a] + 1, vt = r[0x34c0 + 0x1b2f] + 1;
         const uint32_t c0 = r[0x34c0 + 0x1b4c] & 0xffffff; const uint64_t t0 = mach_absolute_time();
-        IOSleep(200);
+        IOSleep(2000);
         const uint32_t c1 = r[0x34c0 + 0x1b4c] & 0xffffff; const uint64_t t1 = mach_absolute_time();
+        const auto timingAfter = phx::readOtgTiming(r);
         mm->release();
         uint64_t ns; absolutetime_to_nanoseconds(t1 - t0, &ns);
         const uint32_t frames = (c1 - c0) & 0xffffff;
@@ -282,6 +289,8 @@ private:
         if (mhz < 24000 || mhz > 360000) { PFBLOG("refresh: %u mHz measured, out of range - 60 Hz assumed", mhz); return; }
         fRefreshMilliHz = mhz; fHTotal = ht; fVTotal = vt;
         fFrameNs = 1000000000000ull / mhz;
+        fPanelTimingValid = phx::decodePanelTiming(timingBefore, timingAfter, fWidth, fHeight, mhz, fPanelTiming);
+        PFBLOG("detailed timing: %s (clock estimated from measured refresh)", fPanelTimingValid ? "validated" : "unavailable; legacy fallback");
         PFBLOG("refresh: OTG0 %ux%u totals, %u frames in %llu us -> %u.%03u Hz", ht, vt, frames, ns / 1000, mhz / 1000, mhz % 1000);
     }
 
@@ -413,7 +422,21 @@ public:
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
         if (mode != 1 || !info) return kIOReturnUnsupportedMode;
         bzero(info, sizeof(*info));
-        info->appleTimingID = kIOTimingIDInvalid;   // no detailed timing: the panel keeps the firmware's
+        info->appleTimingID = kIOTimingIDInvalid;
+        if (fPanelTimingValid) {
+            const auto &p = fPanelTiming;
+            auto &t = info->detailedInfo.v2;
+            t.pixelClock = p.pixelClock;
+            // Clock error bounds are unknown. Leave min/max zero: do not opt into IOFB's clock-based VBL throttling.
+            t.horizontalActive = p.width; t.horizontalBlanking = p.hTotal - p.width;
+            t.horizontalSyncOffset = p.hSyncOffset; t.horizontalSyncPulseWidth = p.hSyncWidth;
+            t.verticalActive = p.height; t.verticalBlanking = p.vTotal - p.height;
+            t.verticalSyncOffset = p.vSyncOffset; t.verticalSyncPulseWidth = p.vSyncWidth;
+            t.signalConfig = kIODigitalSignal;
+            t.horizontalSyncConfig = p.hPositive ? kIOSyncPositivePolarity : 0;
+            t.verticalSyncConfig = p.vPositive ? kIOSyncPositivePolarity : 0;
+            info->flags = kIODetailedTimingValid;
+        }
         return kIOReturnSuccess;
     }
     IOItemCount getConnectionCount() override { return 1; }

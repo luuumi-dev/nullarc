@@ -82,3 +82,9 @@ kext:
 
 clean:
 	rm -rf build/
+
+.PHONY: test-panel-timing
+test-panel-timing: | $(TEST_BIN_DIR)
+	$(CXX) -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_upstream34_panel_timing.cpp -o $(TEST_BIN_DIR)/panel-timing
+	./$(TEST_BIN_DIR)/panel-timing
+	python3 tests/test_upstream34_panel_callbacks.py
