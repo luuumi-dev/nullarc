@@ -968,7 +968,7 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
         return kIOReturnNotReady;
     }
     GpuQueue &q = *qp;
-    const uint32_t need = n * 4 + 8;
+    const uint32_t need = n * 4 + 8 + (q.gfx ? 0u : 8u);
     if (need + 16 > q.ringDw) {
         IOLockUnlock(gpuLock);
         return kIOReturnBadArgument;
@@ -995,6 +995,16 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
         return result;
     }
     uint32_t k = 0;
+    if (!q.gfx) {
+        ringPut(q, k++, 0xc0065800u);
+        ringPut(q, k++, 0x00000000u);
+        ringPut(q, k++, 0xffffffffu);
+        ringPut(q, k++, 0x00ffffffu);
+        ringPut(q, k++, 0x00000000u);
+        ringPut(q, k++, 0x00000000u);
+        ringPut(q, k++, 0x0000000au);
+        ringPut(q, k++, 0x0000c3b1u);
+    }
     for (uint32_t i = 0; i < n; i++) {
         ringPut(q, k++, 0xC0023F00);                               // INDIRECT_BUFFER
         // the CP wants the canonical (sign-extended) address: an upper-half IB (bit 47, where RADV puts them) with a
