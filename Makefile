@@ -82,3 +82,9 @@ kext:
 
 clean:
 	rm -rf build/
+
+.PHONY: test-framebuffer-pool-alias
+test-framebuffer-pool-alias: | $(TEST_BIN_DIR)
+	$(CXX) -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_upstream34_alias_policy.cpp -o $(TEST_BIN_DIR)/alias-policy
+	./$(TEST_BIN_DIR)/alias-policy
+	python3 tests/test_upstream34_framebuffer.py

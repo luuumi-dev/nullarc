@@ -22,6 +22,7 @@
 #include <sys/sysctl.h>
 #include "nvrm_vram_abi.h"
 #include "nvrm_gpuva_abi.h"
+#include "../PhxHardwarePolicy.hpp"
 
 void phxAgdcInstall();   // phxagdc.cpp: the AppleGraphicsDeviceControl that reports this panel (debug.phxagdc)
 void phxAgdcRemove();
@@ -92,7 +93,10 @@ private:
     IOMemoryMap *fAliasMap = nullptr;
     IOMemoryMap *fMmio = nullptr;      // BAR5, for the backlight PWM
     IOService *fBacklight = nullptr;   // the brightness parameter handler, named "backlight"
-    unsigned fAliasTries = 0;
+    unsigned fAliasTries = 0;    // mapping/pixel verification attempts
+    unsigned fAliasWaits = 0;    // metadata waits do not spend verification attempts
+    static constexpr unsigned kAliasVerifyLimit = phx780m::kAliasVerifyLimit;
+    static constexpr unsigned kAliasWaitLimit = phx780m::kAliasWaitLimit;
     volatile UInt32 fAliasBusy = 0;
     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
     Irq fVbl[4], fConnect;   // IOFramebuffer itself and, when it asks, IOAccelDisplayPipe each register a VBL handler
@@ -134,7 +138,7 @@ private:
             if (b && b->prepare() != kIOReturnSuccess) OSSafeReleaseNULL(b);
             if (!b) continue;
             fPoolRange = IORangeAllocator::withRange(bytes, PAGE_SIZE, 0, IORangeAllocator::kLocking);
-            if (!fPoolRange) { b->complete(); b->release(); return; }
+            if (!fPoolRange) { b->complete(); b->release(); continue; }   // try a smaller pool
             fPool = b; fPoolKva = (uint8_t *)b->getBytesNoCopy(); fPoolBytes = bytes;
             fPoolPhys = b->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
             PFBLOG("VRAM pool: %llu MB at phys 0x%llx", bytes >> 20, fPoolPhys);
@@ -190,8 +194,16 @@ private:
     IOReturn vramFree(NVRMVramRequest *r) {
         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
         if (IOSubMemoryDescriptor *s = OSDynamicCast(IOSubMemoryDescriptor, (OSObject *)r->handle)) {
-            const uint64_t off = (uint64_t)((uint8_t *)r->kva - fPoolKva), len = s->getLength();
-            if (!fPoolRange || (uint8_t *)r->kva < fPoolKva || off + len > fPoolBytes) return kIOReturnBadArgument;
+            // Validate the handle as integers before the range allocator sees it: subtracting a pointer that need not
+            // point into the pool is undefined, and the old `off + len` check could wrap. Either one could hand the
+            // allocator a partial or foreign extent to release. Pool allocations are page-granular and never zero.
+            const uint64_t kva = (uint64_t)(uintptr_t)r->kva, base = (uint64_t)(uintptr_t)fPoolKva;
+            const uint64_t len = s->getLength();
+            if (!fPoolRange || !fPoolKva || kva < base || !phx780m::poolReleaseValid(kva - base, len, fPoolBytes)) {
+                PFBLOG("VRAM: release refused: kva 0x%llx len 0x%llx outside the %llu-byte pool", kva, len, fPoolBytes);
+                return kIOReturnBadArgument;
+            }
+            const uint64_t off = kva - base;
             OSAddAtomic64(-(SInt64)len, &fVramBytes);
             fPoolRange->deallocate(off, len);
             s->release();
@@ -560,10 +572,9 @@ public:
     // The scan-out through the carve-out, once PhxBringup has published where the carve-out sits (phx-fb-phys) and only
     // if that view holds the pixels the BAR shows. NULL (copy through the BAR) until then.
     IOMemoryMap *aliasMap() {
-        if (fAliasMap || fAliasTries >= 3) return fAliasMap;
+        if (fAliasMap || phx780m::aliasExhausted(fAliasTries, fAliasWaits)) return fAliasMap;
         if (!OSCompareAndSwap(0, 1, &fAliasBusy)) return nullptr;
-        if (!fAliasMap && fAliasTries < 3) {
-            fAliasTries++;
+        if (!fAliasMap) {
             uint64_t fbPhys = 0, barOff = ~0ull;
             if (OSIterator *it = fPCI->getChildIterator(gIOServicePlane)) {
                 while (OSObject *o = it->getNextObject()) {
@@ -580,19 +591,27 @@ public:
                     break;
                 }
             }
+            // PhxBringup can publish the carve-out after this framebuffer's first presents. That is a wait, not a
+            // failed check: counting three early presents as verification failures pinned the session to the BAR copy
+            // path (~110 ms a frame at 2560x1600) for its whole life. Only a real pixel mismatch uses the budget.
+            if (!phx780m::aliasCarveOutReady(fbPhys, barOff)) {
+                if (!fAliasWaits++) PFBLOG("alias: carve-out not published yet (ram 0x%llx, BAR offset 0x%llx): retrying", fbPhys, barOff);
+                fAliasBusy = 0;
+                return fAliasMap;
+            }
+            fAliasTries++;
             const uint64_t phys = fbPhys + barOff, bytes = (uint64_t)fRowBytes * fHeight;
             IOMemoryMap *m = nullptr;
-            if (fbPhys && barOff != ~0ull)
-                if (IODeviceMemory *dm = IODeviceMemory::withRange(phys, bytes)) { m = dm->map(kIOMapWriteCombineCache); dm->release(); }
+            if (IODeviceMemory *dm = IODeviceMemory::withRange(phys, bytes)) { m = dm->map(kIOMapWriteCombineCache); dm->release(); }
             if (m) {
                 const volatile uint32_t *a = (const volatile uint32_t *)m->getVirtualAddress();
                 const volatile uint32_t *b = (const volatile uint32_t *)fSurfMap->getVirtualAddress();
-                const uint64_t words = bytes / 4, step = words / 4096 ? words / 4096 : 1;
+                const uint64_t words = bytes / 4, step = phx780m::aliasSampleStep(words);
                 unsigned same = 0, nz = 0, n = 0;
                 for (uint64_t w = 0; w < words; w += step, n++) { const uint32_t x = a[w], y = b[w]; same += x == y; nz += y != 0; }
                 PFBLOG("alias: scan-out at BAR offset 0x%llx = system RAM 0x%llx: %u of %u samples match the BAR (%u non-zero)",
                        barOff, phys, same, n, nz);
-                if (same == n && nz) fAliasMap = m; else m->release();
+                if (phx780m::aliasSamplesMatch(same, n, nz)) fAliasMap = m; else m->release();
             } else {
                 PFBLOG("alias: carve-out 0x%llx, scan-out BAR offset 0x%llx: no system-RAM view, copying through the BAR", fbPhys, barOff);
             }
