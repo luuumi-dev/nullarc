@@ -303,6 +303,56 @@ static int nvmtl_skip_empty_on(void) {
     return on;
 }
 
+static char nvmtl_execution_queue_key;
+static BOOL nvmtl_cb_writes_surfaces(NVMTLCommandBuffer *cb);
+static BOOL nvmtl_surface_commit_wait_on(void) {
+    static BOOL on; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_SURFACE_COMMIT_WAIT"), *me = getprogname();
+        on = e && !strcmp(e, "1") && !getenv("NVMTL_NO_SURFACE_COMMIT_WAIT")
+            && !(me && !strcmp(me, "WindowServer"));
+    });
+    return on;
+}
+static unsigned nvmtl_surface_commit_wait_ms(void) {
+    static unsigned ms = 250; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_SURFACE_COMMIT_WAIT_MS");
+        if (!e) return;
+        char *end; unsigned long n = strtoul(e, &end, 10);
+        if (*e >= '0' && *e <= '9' && !*end && n >= 1 && n <= 2000) ms = (unsigned)n;
+        else nvlog("surface commit wait: invalid budget; using 250 ms (allowed 1..2000)");
+    });
+    return ms;
+}
+static void nvmtl_surface_commit_prepare(NVMTLCommandBuffer *cb) {
+    // Called after sealing, before dispatch, under the submission lock. The
+    // worker replaces/removes _parts; never enumerate them after submission.
+    if (!nvmtl_surface_commit_wait_on() || !nvmtl_cb_writes_surfaces(cb)) return;
+    cb->_surfaceCommitGroup = dispatch_group_create();
+    dispatch_group_enter(cb->_surfaceCommitGroup);
+}
+static BOOL nvmtl_surface_commit_wait(NVMTLCommandBuffer *cb) {
+    if (!cb->_surfaceCommitGroup || dispatch_get_specific(&nvmtl_execution_queue_key)) return NO;
+    const unsigned ms = nvmtl_surface_commit_wait_ms();
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const long pending = dispatch_group_wait(cb->_surfaceCommitGroup,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * NSEC_PER_MSEC));
+    const uint64_t elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+    if (pending) {
+        static _Atomic unsigned long timeouts;
+        const unsigned long n = atomic_fetch_add(&timeouts, 1) + 1;
+        if (n <= 4 || !(n & (n - 1)))
+            nvlog("surface commit wait: deadline expired after %llu us (budget %u ms, #%lu); publication unconfirmed, retaining pending work",
+                (unsigned long long)(elapsed / 1000), ms, n);
+    }
+    nvtrace("surface commit wait: %s after %llu us (budget %u ms)", pending ? "deadline expired" : "ready",
+        (unsigned long long)(elapsed / 1000), ms);
+    // Timeout is not GPU completion: leave status, resources and reservations
+    // to the existing execution path. No successful publication is inferred.
+    return !pending;
+}
+
 @implementation NVMTLCommandBuffer (EventSubmission)
 - (void)nvmtlReserveQueue {
     if (_reservation) return;
@@ -482,6 +532,7 @@ static void nvmtl_ws_gputime(double submitted, double start, double end, double 
     [self nvmtlDispatchHandlers:handlers scheduled:NO];
     _completionReady = YES;
     [_completionCondition broadcast]; [_completionCondition unlock];
+    if (_surfaceCommitGroup) dispatch_group_leave(_surfaceCommitGroup);
 }
 static unsigned nvmtl_gsub_cap(void) {
     static int cap = -1;
@@ -713,6 +764,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (!__atomic_load_n(&_rep, __ATOMIC_ACQUIRE)) __atomic_store_n(&_rep, nvmtl_ep_enter(), __ATOMIC_RELEASE);
         [_completionCondition lock]; _cbstatus = MTLCommandBufferStatusCommitted; [_completionCondition unlock];
         [self nvmtlSealPartWithSignal:nil value:0 restart:NO];
+        nvmtl_surface_commit_prepare(self);
     }
     // the commit's kernel marks can wait for the accelerator lock, so they go in outside the class lock (see
     // nvmtl_ws_mark_pending). This command buffer is committed and holds its queue reservation, but nothing submits it
@@ -762,7 +814,10 @@ static BOOL nvmtl_commit_ahead_on(void) {
 static void nvmtl_pump_buffers(void) {
     static dispatch_once_t once; static dispatch_queue_t worker;
     const BOOL async = nvmtl_async_commit_on();
-    if (async) dispatch_once(&once, ^{ worker = dispatch_queue_create("nvmtl.execution", DISPATCH_QUEUE_SERIAL); });
+    if (async) dispatch_once(&once, ^{
+        worker = dispatch_queue_create("nvmtl.execution", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_set_specific(worker, &nvmtl_execution_queue_key, &nvmtl_execution_queue_key, NULL);
+    });
     if (!async) { nvmtl_vk_clock_refresh(); nvmtl_pump_buffers_sync(); return; }
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_pending_buffers.count) return;
