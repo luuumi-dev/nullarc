@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#import "nvmtl_surface_key.h"
+
 @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
 @implementation NVMTLQueueReservation @end
 @interface NVMTLSubmissionPart : NSObject {
@@ -43,17 +45,13 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
 static NSMapTable *nvmtl_surface_writers;
-static inline id<NSCopying> nvmtl_surface_plane_key(uint32_t sid, NSUInteger plane) {
-    if (plane < 256) return @(((uint64_t)sid << 8) | plane);
-    return [NSString stringWithFormat:@"%u:%lu", sid, (unsigned long)plane];
-}
-static inline id<NSCopying> nvmtl_surface_writer_key(NVMTLTexture *t) {
-    return nvmtl_surface_plane_key((uint32_t)IOSurfaceGetID(t->_surf), t->_plane);
+static id nvmtl_surface_writer_key(NVMTLTexture *t) {
+    return nvmtl_surface_key(IOSurfaceGetID(t->_surf), t->_plane);
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t || !t->_surf) return NO;
     @synchronized ([NVMTLCommandBuffer class]) {
-        id<NSCopying> key = nvmtl_surface_writer_key(t);
+        id key = nvmtl_surface_writer_key(t);
         for (id queue in nvmtl_surface_writers.keyEnumerator) {
             NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
             NVMTLPendingSurfaceWrite *write = writes[key];
