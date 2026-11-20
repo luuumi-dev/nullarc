@@ -1,0 +1,33 @@
+name: PhxCPPC kext
+
+on:
+  push:
+    paths:
+      - "src/phxcppc/**"
+      - ".github/workflows/phxcppc-kext.yml"
+  workflow_dispatch:
+
+jobs:
+  kext:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git "$RUNNER_TEMP/MacKernelSDK"
+          sh src/phxcppc/build.sh "$RUNNER_TEMP/MacKernelSDK"
+      - name: Check the bundle
+        run: |
+          K=src/phxcppc/build/PhxCPPC.kext
+          lipo -archs "$K/Contents/MacOS/PhxCPPC" | grep -qx x86_64
+          plutil -lint "$K/Contents/Info.plist"
+          nm -u "$K/Contents/MacOS/PhxCPPC" | tee "$RUNNER_TEMP/undef.txt"
+          shasum -a 256 "$K/Contents/MacOS/PhxCPPC" | tee "$RUNNER_TEMP/sha256.txt"
+          cd src/phxcppc/build && ditto -c -k --keepParent PhxCPPC.kext "$RUNNER_TEMP/PhxCPPC.kext.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhxCPPC-kext-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/PhxCPPC.kext.zip
+            ${{ runner.temp }}/sha256.txt
+            ${{ runner.temp }}/undef.txt
