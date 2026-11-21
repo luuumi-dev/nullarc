@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #import "NVMTLObjects.h"
 #include <dlfcn.h>
 #include <stdatomic.h>
@@ -297,6 +299,29 @@ static void nvmtl_cache_touch(const char *path) {
     if (atomic_load_explicit(&nvmtl_touch_refused, memory_order_relaxed)) return;
     if (utimes(path, NULL) != 0 && (errno == EPERM || errno == EACCES)) atomic_store(&nvmtl_touch_refused, 1);
 }
+// Cache entries are stored with a POSIX temp file + rename(2) in the cache folder itself. Foundation's atomic write
+// goes through an item-replacement directory, which the WebKit GPU process sandbox refuses ("You don't have permission
+// to save the file ... in the folder spvcache"): Safari then stored nothing and translated every shader again on each
+// launch (seconds of fixed_frag_lpf_cpf before a page's controls answered). Mesa's disk cache, beside it, already
+// writes this way and works there.
+static BOOL nvmtl_cache_store(NSData *data, NSString *path) {
+    if (!data || !path.length) return NO;
+    static _Atomic unsigned seq, said;
+    char tmp[PATH_MAX]; const char *step = "open"; int e = 0;
+    if (snprintf(tmp, sizeof tmp, "%s.tmp-%d-%u", path.fileSystemRepresentation, getpid(), atomic_fetch_add(&seq, 1)) >= (int)sizeof tmp) return NO;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    BOOL ok = fd >= 0; if (!ok) e = errno;
+    if (ok) {
+        const uint8_t *b = data.bytes; size_t left = data.length;
+        while (left) { ssize_t w = write(fd, b, left); if (w < 0) { if (errno == EINTR) continue; ok = NO; e = errno; step = "write"; break; } b += w; left -= (size_t)w; }
+        if (close(fd) != 0 && ok) { ok = NO; e = errno; step = "close"; }
+        if (ok && rename(tmp, path.fileSystemRepresentation) != 0) { ok = NO; e = errno; step = "rename"; }
+        if (!ok) unlink(tmp);
+    }
+    if (!ok && atomic_fetch_add(&said, 1) < 4) nvlog("cache store: %s failed for %s: %s", step, tmp, strerror(e));
+    return ok;
+}
+static BOOL nvmtl_cache_store_text(NSString *text, NSString *path) { return nvmtl_cache_store([text dataUsingEncoding:NSUTF8StringEncoding], path); }
 static BOOL nvmtl_dir_writable(NSString *d) {
     if (!d || ![[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
     NSString *probe = [d stringByAppendingPathComponent:[NSString stringWithFormat:@".probe-%d", getpid()]];
@@ -639,7 +664,7 @@ static NSString *nvmtl_air_to_text(NSData *air) {
     gAirMiss++;
     NSString *memoryIR = nvmtl_air_in_memory(air);
     if (memoryIR.length) {
-        if ([memoryIR writeToFile:cache atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++;
+        if (nvmtl_cache_store_text(memoryIR, cache)) gAirStored++;
         return memoryIR;
     }
 
@@ -656,7 +681,7 @@ static NSString *nvmtl_air_to_text(NSData *air) {
         NSError *mkerr = nil;
         [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir()
                                   withIntermediateDirectories:YES attributes:nil error:&mkerr];
-        if ([ll writeToFile:cache atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++;
+        if (nvmtl_cache_store_text(ll, cache)) gAirStored++;
     }
     return ll;
 }
@@ -865,13 +890,11 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
                 nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
-            { NSError *werr = nil;
-              if (spvp && [spvData writeToFile:spvp options:NSDataWritingAtomic error:&werr]) {
+            { if (spvp && nvmtl_cache_store(spvData, spvp)) {
                   gSpvStored++;
                   atomic_fetch_add_explicit(&gSpvAdded, (unsigned long long)spvData.length, memory_order_relaxed);
               } else if (spvp) {
-                  nvlog("spvcache: STORE FAILED %s (%zu bytes): %s", spvp.lastPathComponent.UTF8String,
-                        (size_t)spvData.length, werr.localizedDescription.UTF8String ?: "?");
+                  nvlog("spvcache: STORE FAILED %s (%zu bytes)", spvp.lastPathComponent.UTF8String, (size_t)spvData.length);
               } }
         }
         if (spv && xlate_free) xlate_free(spv, spvn);
@@ -1048,7 +1071,7 @@ static NSDictionary *nvmtl_index_metallib_disk(NSData *lib, NSData *key, NSDicti
         NSData *out = [NSPropertyListSerialization dataWithPropertyList:@{@"v": @1, @"length": @(lib.length), @"blobs": rec, @"externs": ext}
                                                                  format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
         NSString *tmp = [p stringByAppendingFormat:@".%d.tmp", getpid()];
-        if (out && [out writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, p.fileSystemRepresentation) == 0)
+        if (out && nvmtl_cache_store(out, p))
             nvlog("library index: disk record stored (%lu blobs, %lu externs) %s", (unsigned long)rec.count, (unsigned long)ext.count, p.lastPathComponent.UTF8String);
         else { unlink(tmp.fileSystemRepresentation); nvlog("library index: could not store the disk record %s", p.lastPathComponent.UTF8String); }
     }
@@ -1115,7 +1138,7 @@ NSData *nvmtl_libkey_for_file(NSString *path, NSData *lib, const struct stat *be
     memcpy(r.edge, edge, sizeof edge); memcpy(r.key, key.bytes, sizeof r.key);
     [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir() withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *tmp = [rp stringByAppendingFormat:@".%d.tmp", getpid()];
-    if ([[NSData dataWithBytes:&r length:sizeof r] writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, rp.fileSystemRepresentation) == 0) {
+    if (nvmtl_cache_store([NSData dataWithBytes:&r length:sizeof r], rp)) {
         const unsigned long st = atomic_fetch_add(&gLkStored, 1) + 1;
         if (!(st & (st - 1))) nvlog("library key memo: stored %lu (%lu B %s)", st, (unsigned long)lib.length, path.lastPathComponent.UTF8String);
     } else { unlink(tmp.fileSystemRepresentation); nvlog("library key memo: could not store %s", name); }
@@ -1260,7 +1283,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     gFcMiss++;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
     if (result) {
-        if (path && [result writeToFile:path atomically:YES]) gFcStored++;
+        if (path && nvmtl_cache_store(result, path)) gFcStored++;
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:path cost:result.length];
         nvlog("fc cache: miss %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
               (unsigned long)result.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
@@ -1334,7 +1357,7 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
     NSData *d = [NSData dataWithBytes:j length:jn];
     if (xlate_free) xlate_free(j, jn);
     id obj = d.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
-    if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count] && [d writeToFile:path atomically:YES]) gRfStored++;
+    if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count] && nvmtl_cache_store(d, path)) gRfStored++;
     if (useCache && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) [nvmtl_memo() setObject:d forKey:path cost:d.length];
     if (!(mn & (mn - 1))) nvlog("refl cache: miss %s %zu B %.2f ms [%lu hit, %lu miss, %lu stored]", function ? function->_fname.UTF8String : "?",
                                 jn, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, (unsigned long)gRfHit, mn, (unsigned long)gRfStored);
@@ -1373,7 +1396,7 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     }
     unsigned long mn = ++gLkMiss;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
-    if (result && path && [result writeToFile:path atomically:YES]) gLkStored++;
+    if (result && path && nvmtl_cache_store(result, path)) gLkStored++;
     if (!(mn & (mn - 1))) nvlog("link cache: miss %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", (unsigned long)result.length,
                                 (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, (unsigned long)gLkHit, mn, (unsigned long)gLkStored);
     return result;
@@ -1782,7 +1805,7 @@ NSData *nvmtl_translate_variant(NVMTLFunction *fn, NSDictionary *states, NSDicti
     NSData *hit=[NSData dataWithContentsOfFile:path];uint32_t magic=0;
     if(hit.length>=20 && hit.length%4==0){memcpy(&magic,hit.bytes,4);if(magic==0x07230203){[nvmtl_memo() setObject:hit forKey:path cost:hit.length];nvlog("variant cache: hit %s",fn->_fname.UTF8String);return hit;}}
     NSData *result=nvmtl_translate_variant_uncached(fn,states,tgLen,err);
-    if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:path cost:result.length];BOOL stored=[result writeToFile:path atomically:YES];nvlog("variant cache: miss %s stored=%d",fn->_fname.UTF8String,stored);}
+    if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:path cost:result.length];BOOL stored=nvmtl_cache_store(result,path);nvlog("variant cache: miss %s stored=%d",fn->_fname.UTF8String,stored);}
     return result;
 }
 
