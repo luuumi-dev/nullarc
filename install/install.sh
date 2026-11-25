@@ -85,6 +85,8 @@ done
 chown -R root:wheel "$H"
 codesign --force --sign - "$H/NVMTLDriver.bundle" >/dev/null 2>&1
 codesign --verify --strict "$H/NVMTLDriver.bundle" && say "  plugin signature ok"
+# a macOS update deletes $H; phxboot puts it back from this copy (and refreshes it after every good boot)
+tar -C "$(dirname "$H")" --exclude aircache --exclude spvcache -czf "$G/backup/PhxGPU.tgz" PhxGPU && say "  copy for macOS updates: $G/backup/PhxGPU.tgz"
 mkdir -p "$L"
 for n in NVMTLDriver.bundle nvmtl; do
     if [ -e "$L/$n" ] && [ ! -L "$L/$n" ]; then mkdir -p "/Library/GPUBundles-backup/$TS"; mv "$L/$n" "/Library/GPUBundles-backup/$TS/"; fi
