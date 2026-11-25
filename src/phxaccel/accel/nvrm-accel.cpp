@@ -340,7 +340,15 @@ public:
     struct thread_call *fHeadlessCall = nullptr;
     struct thread_call *fFanCall = nullptr;
     static void fanWorker(void *p0, void *p1);
+    // The EC fan control below is for the Firebat U6C's EC: 0xFE0B0400 is the generic AMD EC RAM window, so on any other
+    // machine these writes land in a different EC's registers. Only with the boot-arg -phxfirebat.
+    static bool firebatEC() {
+        static int v = -1;
+        if (v < 0) { char a[4]; v = PE_parse_boot_argn("-phxfirebat", a, sizeof a) ? 1 : 0; if (!v) IOLog("PhxAccel: Firebat EC fan control off (boot-arg -phxfirebat turns it on)\n"); }
+        return v == 1;
+    }
     void armFanWorker() {
+        if (!firebatEC()) return;
         fFanCall = thread_call_allocate(&NVAccel::fanWorker, this);
         if (fFanCall) {
             uint64_t when = 0;
@@ -689,7 +697,7 @@ public:
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
-            if (vm_offset_t va = ml_io_map(0xFE0B0400, 0x100)) {
+            if (vm_offset_t va = firebatEC() ? ml_io_map(0xFE0B0400, 0x100) : 0) {
                 volatile uint8_t *ec = (volatile uint8_t *)va;
                 ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
                 ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan boost if active)
@@ -1393,6 +1401,7 @@ void NVAccel::fanWorker(void *p0, void *p1)
 
 static int firebat_fan_mode_sysctl SYSCTL_HANDLER_ARGS
 {
+    if (!NVAccel::firebatEC()) return ENODEV;
     vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
     if (!va) return EIO;
     volatile uint8_t *ec = (volatile uint8_t *)va;
