@@ -11,6 +11,13 @@ LOG=/var/log/phxboot.log; MARK=/var/db/phxboot.pending; OFF=$G/phxboot-off
 ALLOW=/Library/GPUBundles/nvmtl-allow.txt; DR=/Library/Logs/DiagnosticReports
 exec >>"$LOG" 2>&1
 echo "== $(date '+%F %T') phxboot"
+# A macOS update rebuilds CoreTypes.bundle/Contents/Library and deletes PhxGPU (the Metal plugin + Mesa): without it
+# WindowServer asserts "Failed to create MetalDevice" (seen on 26.7.2 -> 26.7.3). Put it back from the copy that
+# install.sh and the end of every good boot keep in $PGT, before WindowServer looks for the Metal device.
+PG=/System/Library/CoreServices/CoreTypes.bundle/Contents/Library/PhxGPU; PGT=$G/backup/PhxGPU.tgz; RESTORED=0
+if [ ! -e $PG/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver ] && [ -f $PGT ]; then
+    tar -C ${PG%/*} -xzf $PGT && RESTORED=1 && echo "PhxGPU was missing (macOS update?): restored from $PGT"
+fi
 release() { sysctl -w debug.phxfb_hold=0 >/dev/null 2>&1; }
 # NVRAM changes reach flash on a clean shutdown only, unless forced: the arming written after a good boot was lost when
 # the battery ran out overnight, and the next boot left WindowServer on the firmware framebuffer (2026-10-22)
@@ -28,6 +35,10 @@ all_apps() { { printf '# phxboot: Metal for every app%s\n' "$1"; for d in $DENY;
 # PhxAMDFB without the arming leaves the panel black: give up on M2 (until $G/phxboot-m2 is put back) and reboot into
 # the firmware framebuffer
 m2_fail() {
+    if [ $RESTORED = 1 ]; then  # WindowServer was faster than the restore: try M2 once more with PhxGPU in place
+        echo "M2 failed ($1) right after the PhxGPU restore: rebooting with M2 kept"
+        rm -f "$MARK"; sync; shutdown -r now; exit 0
+    fi
     echo "M2 failed ($1): PhxAMDFB off, rebooting"
     apps_only; sysctl -w debug.phxagdc=0 >/dev/null 2>&1
     nvram -d phxfb-boot; nv_commit; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
@@ -94,6 +105,11 @@ fi
 [ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && { nv_commit; echo "PhxAMDFB armed for the next boot"; }
 rm -f "$MARK"; sync
 echo "done $(date '+%T')"
+# keep $PGT in step with the installed PhxGPU (a new plugin build or nvrm610.conf), shader caches left out
+if [ -e $PG/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver ] && { [ ! -f $PGT ] || \
+   [ -n "$(find $PG -newer $PGT -not -path '*cache*' -print -quit)" ]; }; then
+    tar -C ${PG%/*} --exclude aircache --exclude spvcache -czf $PGT.new PhxGPU && mv -f $PGT.new $PGT && echo "PhxGPU copy refreshed: $PGT"
+fi
 
 # A GPU hang leaves WindowServer waiting on a fence until watchdogd kills it, and every WindowServer after it hangs the
 # same way: the session is logged out and the screen stays black. There is no GPU reset yet, so two WindowServer
