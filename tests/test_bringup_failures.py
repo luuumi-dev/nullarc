@@ -18,6 +18,8 @@ with (base/'events').open('a') as f: f.write(json.dumps([name,args])+'\n')
 command=' '.join([name]+args[:2])
 if name=='id': print('0')
 elif name=='ioreg':
+    for key, value in json.loads(os.environ.get('BOOT_FB_LAYOUT','{}')).items():
+        print('    \"'+key+'\" = '+str(value))
     if os.environ.get('BOOT_M2')=='1':
         print('class '+ ('PhxAMDFB' if 'PhxAMDFB' in args else 'NMXAccel' if 'NMXAccel' in args else 'IOFramebuffer'))
     else: print('class IONDRVFramebuffer')
@@ -30,7 +32,7 @@ if name=='kill': sys.exit(int(os.environ.get('KILL_STATUS','0')))
 
 
 class BringupFailureTest(unittest.TestCase):
-    def run_script(self, name, fail='', kill_status=0, boot_full_status=0, m2=False, arming=False):
+    def run_script(self, name, fail='', kill_status=0, boot_full_status=0, m2=False, arming=False, layout=None):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             gpu = base / 'gpu'
@@ -61,9 +63,47 @@ class BringupFailureTest(unittest.TestCase):
                 (gpu/'full.sh').write_text('echo "compute: attempted"\nexit '+str(boot_full_status)+'\n')
             result = subprocess.run(['bash', str(path),'kiqsched'],capture_output=True,text=True,timeout=10,
                                     env=dict(os.environ,PATH=str(commands)+':/usr/bin:/bin',BOOT_TEST=str(base),
-                                             BOOT_FAIL=fail,KILL_STATUS=str(kill_status),BOOT_M2=str(int(m2))))
+                                             BOOT_FAIL=fail,KILL_STATUS=str(kill_status),BOOT_M2=str(int(m2)),
+                                             BOOT_FB_LAYOUT=json.dumps(layout if layout is not None else {
+                                                 'phx-fb-phys': 0x6A04000000, 'phx-fb-mc-base': 0x8000000000,
+                                                 'phx-fb-size': 0x20000000, 'phx-fb-aper-len': 0x10000000})))
             events = [json.loads(s) for s in (base/'events').read_text().splitlines()]
             return result.returncode, events, (base/'reached').exists()
+
+    def test_tmr_uses_captured_physical_and_mc_addresses(self):
+        for physical, mc in ((0x6A04000000, 0x8000000000), (0x17E0000000, 0x9000000000)):
+            with self.subTest(physical=physical):
+                rc, events, _ = self.run_script('bringup5.sh', layout={
+                    'phx-fb-phys': physical, 'phx-fb-mc-base': mc,
+                    'phx-fb-size': 0x80000000, 'phx-fb-aper-len': 0x10000000})
+                self.assertEqual(rc, 0)
+                commands = [[int(a, 0) for a in args[1:]] for name,args in events
+                            if name == 'phxctl' and args[0] == 'raw']
+                self.assertIn([0x20, (mc + 0x4000000) & 0xffffffff,
+                               (mc + 0x4000000) >> 32, 0x900, 0, 0, 0], commands)
+                self.assertIn([5, (mc + 0x8000000) & 0xffffffff,
+                               (mc + 0x8000000) >> 32, 0x4000000, 2,
+                               (physical + 0x8000000) & 0xffffffff,
+                               (physical + 0x8000000) >> 32], commands)
+
+    def test_invalid_layout_aborts_before_hardware_or_watchdog(self):
+        valid = {'phx-fb-phys': 0x17E0000000, 'phx-fb-mc-base': 0x8000000000,
+                 'phx-fb-size': 0x80000000, 'phx-fb-aper-len': 0x10000000}
+        invalid = [{}]
+        for key in valid:
+            for value in ('missing', 'bad', -1, 0, 0x7fffffffffffffff):
+                layout = dict(valid)
+                if value == 'missing': del layout[key]
+                else: layout[key] = value
+                invalid.append(layout)
+        invalid += [dict(valid, **{key: value}) for key,value in (
+            ('phx-fb-phys', 0x17E0000001), ('phx-fb-mc-base', 0x8000000001),
+            ('phx-fb-size', 0xbffffff), ('phx-fb-aper-len', 0xbffffff))]
+        for layout in invalid:
+            with self.subTest(layout=layout):
+                rc, events, _ = self.run_script('bringup5.sh', layout=layout)
+                self.assertNotEqual(rc, 0)
+                self.assertFalse(any(name in ('phxctl', 'shutdown', 'kill') for name,args in events))
 
     def test_create_failure_aborts_before_firmware(self):
         rc, events, _ = self.run_script('bringup5.sh', 'phxctl psp create')
@@ -138,7 +178,6 @@ class BringupFailureTest(unittest.TestCase):
                 self.assertEqual(rc,0)
                 self.assertFalse(reached)
                 self.assertIn(['shutdown',['-r','now']],events)
-
 
 if __name__ == '__main__':
     unittest.main()

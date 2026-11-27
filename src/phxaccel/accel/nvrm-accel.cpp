@@ -5,6 +5,7 @@
  */
 
 #include "../nvrm_off.h"
+#include "../../amd/phx_platform.h"
 #ifdef NMX_ACCEL
 // NMXAccel: this accelerator built for the AMD and Intel GPUs that NMXGPU drives (see nmx_accel_names.h)
 #include "nmx_accel_names.h"
@@ -60,6 +61,12 @@ void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 void proc_selfname(char *buf, int size);
 }
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+static bool phxFirebatECEnabled(IOPCIDevice *pci) {
+    int enabled = 0;
+    return PE_parse_boot_argn("-phxfirebat", &enabled, sizeof enabled) && pci && phx_is_firebat_u6c(pci->configRead16(0), pci->configRead16(2), pci->configRead8(8),
+                                     pci->configRead16(0x2c), pci->configRead16(0x2e));
+}
 
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
@@ -341,6 +348,7 @@ public:
     struct thread_call *fFanCall = nullptr;
     static void fanWorker(void *p0, void *p1);
     void armFanWorker() {
+        if (!phxFirebatECEnabled(fPCI)) { ALOG("Firebat EC fan regulator skipped (requires -phxfirebat and Firebat U6C)"); return; }
         fFanCall = thread_call_allocate(&NVAccel::fanWorker, this);
         if (fFanCall) {
             uint64_t when = 0;
@@ -682,6 +690,7 @@ public:
         bool r = IOGraphicsAccelerator2::start(provider);
         ALOG("IOGraphicsAccelerator2::start -> %d", r);
         if (r) {
+            fPCI = OSDynamicCast(IOPCIDevice, provider);
             // Tells the Metal plugin that NVResource::pageoff waits for a surface WindowServer's GPU is still writing
             // (nvSurfWaitReady). Only then does the plugin mark WindowServer's surfaces newest in VRAM at commit; with an
             // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
@@ -689,13 +698,15 @@ public:
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
-            if (vm_offset_t va = ml_io_map(0xFE0B0400, 0x100)) {
-                volatile uint8_t *ec = (volatile uint8_t *)va;
-                ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
-                ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan boost if active)
-                ec[0x32] = 0x82; // FCMI = 0x82 (Quiet Mode)
-                IOLog("PhxAccel: Firebat EC init: OSFG=1, FFFG=0, FCMI=0x82, FCMO=0x%02x\n", ec[0x31]);
-            }
+            if (phxFirebatECEnabled(fPCI)) {
+                if (vm_offset_t va = ml_io_map(0xFE0B0400, 0x100)) {
+                    volatile uint8_t *ec = (volatile uint8_t *)va;
+                    ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
+                    ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan boost if active)
+                    ec[0x32] = 0x82; // FCMI = 0x82 (Quiet Mode)
+                    IOLog("PhxAccel: Firebat EC init: OSFG=1, FFFG=0, FCMI=0x82, FCMO=0x%02x\n", ec[0x31]);
+                } else ALOG("Firebat EC BAR map failed");
+            } else ALOG("Firebat EC init skipped (requires -phxfirebat and Firebat U6C)");
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
                 if (!c) break;
@@ -1352,7 +1363,7 @@ static int gFirebatFanMode = 2; // Default to Quiet (2)
 void NVAccel::fanWorker(void *p0, void *p1)
 {
     NVAccel *me = (NVAccel *)p0;
-    if (!me || me != gAccel) return;
+    if (!me || me != gAccel || !phxFirebatECEnabled(me->fPCI)) return;
 
     vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
     if (va) {
@@ -1393,6 +1404,7 @@ void NVAccel::fanWorker(void *p0, void *p1)
 
 static int firebat_fan_mode_sysctl SYSCTL_HANDLER_ARGS
 {
+    if (!NVAccel::gAccel || !phxFirebatECEnabled(NVAccel::gAccel->fPCI)) return ENODEV;
     vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
     if (!va) return EIO;
     volatile uint8_t *ec = (volatile uint8_t *)va;
@@ -1657,7 +1669,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
-    sysctl_register_oid(&sysctl__debug_firebat_fan_mode);
+    if (NVAccel::gAccel && phxFirebatECEnabled(NVAccel::gAccel->fPCI))
+        sysctl_register_oid(&sysctl__debug_firebat_fan_mode);
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
 #endif

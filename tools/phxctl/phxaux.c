@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 enum { DMU_BASE2 = 0x34c0, AUX0 = DMU_BASE2 + 0x1f50, AUX_STRIDE = 0x1c,
        CONTROL = 0, SW_CONTROL = 1, ARB_CONTROL = 2, INTERRUPT_CONTROL = 3, SW_STATUS = 4, SW_DATA = 6 };
@@ -62,41 +63,67 @@ static int xfer(int cmd, uint32_t addr, uint8_t *data, unsigned len)
     else {
         const unsigned got = (st >> 24) & 0x1f, reply = pick(0) >> 4;
         if (reply != 0) { fprintf(stderr, "AUX reply 0x%x (%s), %u bytes\n", reply, reply & 2 ? "DEFER" : "NACK", got); ret = -2; }
-        else { ret = got ? (int)got - 1 : 0; if (cmd == 9) for (int i = 0; i < ret && i < (int)len; i++) data[i] = next(); }
+        else if (!got || (cmd == 9 && got - 1 > len) || (cmd == 8 && got != 1))
+            fprintf(stderr, "invalid AUX reply length %u for request %u\n", got, len);
+        else { ret = (int)got - 1; if (cmd == 9) for (int i = 0; i < ret; i++) data[i] = next(); }
     }
     W(INTERRUPT_CONTROL, R(INTERRUPT_CONTROL) | 2u);
     W(ARB_CONTROL, R(ARB_CONTROL) | (1u << 17));                       // AUX_SW_DONE_USING_AUX_REG
     return ret;
 }
 
+static int number(const char *text, uint32_t max, uint32_t *value)
+{
+    if (text[0] < '0' || text[0] > '9') return 0;
+    char *end; errno = 0;
+    unsigned long n = strtoul(text, &end, 0);
+    if (errno || *end || n > max) return 0;
+    *value = (uint32_t)n;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
-    if (!s || IOServiceOpen(s, mach_task_self(), 0x4E34384Eu, &c)) { fprintf(stderr, "open failed\n"); return 1; }
-    uint64_t hin[2] = {1, 1u << 8}, hout[4]; uint32_t hn = 4;
-    if (IOConnectCallMethod(c, 0, hin, 2, NULL, 0, hout, &hn, NULL, NULL)) { fprintf(stderr, "hello failed\n"); return 1; }
-    if (argc > 2 && !strcmp(argv[1], "-a")) { aux = AUX0 + AUX_STRIDE * (uint32_t)atoi(argv[2]); argc -= 2; argv += 2; }
+    uint32_t engine = 0, addr = 0, len = 16;
+    uint8_t buf[16] = {0};
+    if (argc > 2 && !strcmp(argv[1], "-a")) {
+        if (!number(argv[2], 4, &engine)) return 2;
+        aux = AUX0 + AUX_STRIDE * engine; argc -= 2; argv += 2;
+    }
     if (argc < 2) { fprintf(stderr, "usage: phxaux [-a n] scan | read <addr> [len] | write <addr> <byte>...\n"); return 2; }
-    if (!strcmp(argv[1], "scan")) {
+    int scan = !strcmp(argv[1], "scan"), read = !strcmp(argv[1], "read");
+    if (scan) { if (argc != 2) return 2; }
+    else {
+        if (argc < 3 || !number(argv[2], 0xfffff, &addr)) return 2;
+        if (read) {
+            if (argc > 4 || (argc == 4 && !number(argv[3], 16, &len)) || !len) return 2;
+        } else if (!strcmp(argv[1], "write") && argc > 3 && argc <= 19) {
+            len = (uint32_t)(argc - 3);
+            for (uint32_t i = 0; i < len; i++) {
+                uint32_t byte;
+                if (!number(argv[3 + i], 255, &byte)) return 2;
+                buf[i] = (uint8_t)byte;
+            }
+        } else return 2;
+        if (len > 0x100000 - addr) return 2;
+    }
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("PhxBringup"));
+    if (!s) { fprintf(stderr, "service not found\n"); return 1; }
+    kern_return_t opened = IOServiceOpen(s, mach_task_self(), 0x4E34384Eu, &c);
+    IOObjectRelease(s);
+    if (opened) { fprintf(stderr, "open failed\n"); return 1; }
+    uint64_t hin[2] = {1, 1u << 8}, hout[4]; uint32_t hn = 4;
+    if (IOConnectCallMethod(c, 0, hin, 2, NULL, 0, hout, &hn, NULL, NULL)) { fprintf(stderr, "hello failed\n"); IOServiceClose(c); return 1; }
+    if (scan) {
         for (int n = 0; n < 5; n++) printf("AUX%d: CONTROL 0x%08x ARB 0x%08x STATUS 0x%08x\n", n, rd(AUX0 + AUX_STRIDE * n),
                                            rd(AUX0 + AUX_STRIDE * n + ARB_CONTROL), rd(AUX0 + AUX_STRIDE * n + SW_STATUS));
-        return 0;
+        IOServiceClose(c); return 0;
     }
-    if (argc < 3) return 2;
-    const uint32_t addr = (uint32_t)strtoul(argv[2], NULL, 0);
-    uint8_t buf[16];
-    if (!strcmp(argv[1], "read")) {
-        unsigned len = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 0) : 16;
-        if (len < 1 || len > 16) return 2;
-        int got = xfer(9, addr, buf, len);
-        if (got < 0) return 1;
+    int got = xfer(read ? 9 : 8, addr, buf, len);
+    IOServiceClose(c);
+    if (got < 0) return 1;
+    if (read) {
         printf("0x%05x:", addr); for (int i = 0; i < got; i++) printf(" %02x", buf[i]); printf("\n");
-        return 0;
     }
-    if (!strcmp(argv[1], "write") && argc > 3 && argc - 3 <= 16) {
-        unsigned len = (unsigned)(argc - 3);
-        for (unsigned i = 0; i < len; i++) buf[i] = (uint8_t)strtoul(argv[3 + i], NULL, 0);
-        return xfer(8, addr, buf, len) < 0;
-    }
-    return 2;
+    return 0;
 }

@@ -564,7 +564,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
     {   /* one GPU per process: the plugin runs a single Vulkan device, so a second Metal device on another vendor's
            accelerator (a PC with an NVIDIA card and an AMD or Intel GPU) is refused rather than given the wrong GPU */
         uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
-        if (mine && mine != live) { nvlog("  accelerator vendor %04x, but this process runs Metal on %04x: no second device", mine, live); return nil; }
+        if (!mine || mine != live) { nvlog("  accelerator vendor %04x, but this process runs Metal on %04x: no second device", mine, live); return nil; }
         nvlog("  GPU vendor %04x (%s)", live, live == 0x1002 ? "AMD, RADV" : live == 0x8086 ? "Intel, ANV" : "NVIDIA, NVK");
     }
     if (!nvmtl_process_is_allowed()) { nvlog("  not allow-listed: no device for %s", getprogname()); return nil; }
@@ -821,6 +821,11 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
 }
+// CoreImage uses this CAMetalLayer descriptor flag to orient drawable output.
+static BOOL nvmtl_desc_drawable(MTLTextureDescriptor *d) {
+    SEL s = sel_registerName("isDrawable");
+    return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -836,6 +841,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
     t->_fbo = nvmtl_desc_fbo(d);
+    t->_drawable = nvmtl_desc_drawable(d);
     t->_fmt = d.pixelFormat;
     uint32_t dvk = 0, dasp = 0;
     if (nvmtl_depthfmt(d.pixelFormat, &dvk, &dasp) == 0) {
@@ -982,10 +988,10 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // frame, a sixth of WindowServer's frame time, 2026-10-21). The backing holds the surface, so its ID cannot be reused
 // while the entry stands; entries whose surface only the backing still holds are dropped at the next insert.
 // Called under @synchronized(device).
-static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
+static void nvmtl_surface_keep(id dev, NSString *key, NVMTLTexture *t) {
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-    for (NSArray *k in keep.allKeys) {
+    for (NSString *k in keep.allKeys) {
         NVMTLTexture *b = keep[k];
         if (!b->_surf || CFGetRetainCount(b->_surf) <= 1) [keep removeObjectForKey:k];
     }
@@ -1008,10 +1014,18 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
     t->_fbo = nvmtl_desc_fbo(d);
+    t->_drawable = nvmtl_desc_drawable(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    // NSArray hashes to its count, causing every surface key to collide.
+    NSString *key = surf ? [NSString stringWithFormat:@"%u/%lu/%zux%zu/%lu/%lu/%d", (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h,
+                            (unsigned long)d.pixelFormat, (unsigned long)t->_ropt, (int)t->_fbo] : nil;
+    if (key && cache.count > 256) {
+        NSMutableArray *dead = [NSMutableArray new];
+        for (NSString *k in cache) if (![cache objectForKey:k]) [dead addObject:k];
+        for (NSString *k in dead) [cache removeObjectForKey:k];
+    }
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
@@ -1020,7 +1034,7 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     if (backing && !backing->_vramOn) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = t->_drawable;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
         }

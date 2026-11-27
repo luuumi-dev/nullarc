@@ -64,12 +64,14 @@ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
  * accelerator), RADV for AMD and ANV for Intel (NMXAccel, the accelerator for the GPUs NMXGPU drives).
  */
 #include <IOKit/IOKitLib.h>
-static uint16_t g_vendor;
-static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
+static uint16_t g_vendor, g_pci_device;
+static uint64_t g_accelerator_id;
+static pthread_mutex_t g_accelerator_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t nvmtl_pci_id_of(io_service_t accel, CFStringRef key)
 {
     io_registry_entry_t pci = 0; uint16_t v = 0;
     if (IORegistryEntryGetParentEntry(accel, kIOServicePlane, &pci) != KERN_SUCCESS) return 0;
-    CFTypeRef d = IORegistryEntryCreateCFProperty(pci, CFSTR("vendor-id"), kCFAllocatorDefault, 0);
+    CFTypeRef d = IORegistryEntryCreateCFProperty(pci, key, kCFAllocatorDefault, 0);
     if (d && CFGetTypeID(d) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)d) >= 2) {
         const UInt8 *b = CFDataGetBytePtr((CFDataRef)d); v = (uint16_t)(b[0] | (b[1] << 8));
     }
@@ -77,26 +79,36 @@ static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
     IOObjectRelease(pci);
     return v;
 }
-/* the vendor of the accelerator a Metal device was made on (0 if the port is neither of ours); the first one wins */
+/* One Vulkan device per process: accept only the same registry accelerator after the first choice. */
 uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
 {
-    uint16_t v = 0;
-    if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
-    else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
-    if (v && !g_vendor) g_vendor = v;
-    return v;
+    uint64_t identity = 0;
+    if (!accel || IORegistryEntryGetRegistryEntryID(accel, &identity) != KERN_SUCCESS || !identity) return 0;
+    uint16_t v = nvmtl_pci_id_of(accel, CFSTR("vendor-id"));
+    uint16_t device = nvmtl_pci_id_of(accel, CFSTR("device-id"));
+    if (!device || !((IOObjectConformsTo(accel, "NMXAccel") && (v == 0x1002 || v == 0x8086)) ||
+                     (IOObjectConformsTo(accel, "NVAccel") && v == 0x10de))) return 0;
+    pthread_mutex_lock(&g_accelerator_lock);
+    if (!g_vendor) { g_vendor = v; g_pci_device = device; g_accelerator_id = identity; }
+    uint16_t accepted = g_accelerator_id == identity && g_vendor == v && g_pci_device == device ? v : 0;
+    pthread_mutex_unlock(&g_accelerator_lock);
+    return accepted;
 }
-/* a process that starts Vulkan before Metal makes a device: NVIDIA when its accelerator runs, else the AMD/Intel one */
+/* Nullarc's AMD accelerator takes precedence when Vulkan is requested before a Metal device. */
 uint16_t nvmtl_vk_vendor(void)
 {
-    if (g_vendor) return g_vendor;
-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
-    if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
-    s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
-    uint16_t v = s ? nvmtl_pci_vendor_of(s) : 0;
+    pthread_mutex_lock(&g_accelerator_lock);
+    uint16_t selected = g_vendor;
+    pthread_mutex_unlock(&g_accelerator_lock);
+    if (selected) return selected;
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
+    uint16_t v = s ? nvmtl_vk_set_accelerator(s) : 0;
     if (s) IOObjectRelease(s);
-    g_vendor = (v == 0x1002 || v == 0x8086) ? v : 0x10de;
-    return g_vendor;
+    if (v) return v;
+    s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    v = s ? nvmtl_vk_set_accelerator(s) : 0;
+    if (s) IOObjectRelease(s);
+    return v;
 }
 static const char *nvmtl_vk_icd_json(void) {
     switch (nvmtl_vk_vendor()) {
@@ -761,8 +773,22 @@ static int nvmtl_vk_initialize(void)
                                : "the enumeration SUCCEEDED and found no device through this ICD");
         return -1; }
     nvlog("vk: pdev %u physical device(s) through this ICD (VkResult %d)", n, (int)er);
-    VkPhysicalDevice pds[8]; if (n > 8) n = 8; pvkEnumeratePhysicalDevices(g_inst, &n, pds); g_pdev = pds[0];
-    VkPhysicalDeviceProperties pp; pvkGetPhysicalDeviceProperties(g_pdev, &pp);
+    VkPhysicalDevice pds[8];
+    if (n > 8 || pvkEnumeratePhysicalDevices(g_inst, &n, pds) != VK_SUCCESS || !n) {
+        nvlog("vk: physical device enumeration failed or exceeded capacity"); return -1;
+    }
+    VkPhysicalDeviceProperties pp;
+    unsigned matches = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        VkPhysicalDeviceProperties candidate; pvkGetPhysicalDeviceProperties(pds[i], &candidate);
+        if (candidate.vendorID == g_vendor && candidate.deviceID == g_pci_device) {
+            g_pdev = pds[i]; pp = candidate; matches++;
+        }
+    }
+    if (matches != 1) {
+        nvlog("vk: expected one physical device for accelerator %04x:%04x, found %u", g_vendor, g_pci_device, matches);
+        g_pdev = VK_NULL_HANDLE; return -1;
+    }
     snprintf(g_name, sizeof g_name, "%s", pp.deviceName);
     g_lim = pp.limits;
     { VkPhysicalDeviceShaderSMBuiltinsPropertiesNV sm = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV };

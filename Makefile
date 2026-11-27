@@ -49,7 +49,10 @@ $(TEST_BIN_DIR)/test_rdna3_ucode: src/amd/rdna3_ucode_extract.cpp tests/test_rdn
 $(TEST_BIN_DIR)/test_r3n_abi: src/uapi/r3n_user_client.cpp src/winsys/radv_r3n_winsys.cpp tests/test_r3n_abi.cpp | $(TEST_BIN_DIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@
 
-test: $(TESTS)
+test: $(TESTS) test-panel-timing
+	python3 tests/test_firebat_ec.py
+	python3 tests/test_texture_metadata.py
+	python3 tests/test_accelerator_selection.py
 	python3 tests/test_native_bo_lifetime.py
 	python3 tests/test_native_stop.py
 	python3 tests/test_native_vm.py
@@ -82,3 +85,9 @@ kext:
 
 clean:
 	rm -rf build/
+
+.PHONY: test-panel-timing
+test-panel-timing: | $(TEST_BIN_DIR)
+	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_upstream34_panel_timing.cpp -o $(TEST_BIN_DIR)/test_panel_timing
+	$(TEST_BIN_DIR)/test_panel_timing
+	python3 tests/test_upstream34_panel_callbacks.py

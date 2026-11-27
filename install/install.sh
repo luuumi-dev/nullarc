@@ -43,8 +43,17 @@ else say "  ✓ System Integrity Protection relaxed"; fi
 # read the registry once: grep -q on a pipe would stop ioreg early, and pipefail counts that as a failure
 IOR=$(ioreg -l -w0)
 build=$(grep -m1 '"phx-build"' <<<"$IOR" | grep -oE '[0-9]+$' || true)
-if [ -n "$build" ]; then say "  ✓ PhxBringup.kext is loaded (build $build)"
-else fail "PhxBringup.kext is not loaded: add EFI/OC/Kexts/PhxBringup.kext to OpenCore and reboot first"; fi
+if [ -n "$build" ]; then say "  ✓ PhxBringup attached and started (build $build)"
+else
+    fail "PhxBringup has no attached service (phx-build is absent)"
+    if grep -q 'org.drip.PhxBringup' <<<"$(kmutil showloaded 2>/dev/null || true)"; then
+        say "    The binary is loaded, but no attached service started on the GPU."
+    else
+        say "    Check EFI/OC/Kexts/PhxBringup.kext and OpenCore Kernel -> Add, then reboot."
+    fi
+    say "    OpenCore injection Success confirms binary inclusion, not PCI attachment."
+    say "    Inspect the GPU PCI/subsystem IDs, kext IOPCIMatch and Console kernel PhxBringup messages."
+fi
 if grep -qE '"compatible" = <[^>]*"pci1002,(15bf|15c8|1900|164e)"' <<<"$IOR"; then say "  ✓ Radeon 780M/760M/740M found"
 else say "  ! no Radeon 780M/760M/740M (1002:15bf/15c8/1900/164e) found: other GPUs are not supported"; fi
 for f in EFI/OC/Kexts/PhxBringup.kext Library/Extensions/PhxAccel.kext PhxGPU/NVMTLDriver.bundle PhxGPU/nvmtl/libvulkan_radeon.dylib \

@@ -74,6 +74,12 @@ static inline kern_return_t IOConnectCallMethod(io_connect_t c, unsigned sel,
     if (buf && sz) {
         memset(buf, 0, *sz);
         if (sel == 2 && *sz >= 4 && (in[0]==0xC040 || in[0]==0xC041)) *(uint32_t *)buf=0xDEADBEEF;
+        if (sel == 2 && *sz >= 4 && getenv("AUX_STATUS_BYTES")) {
+            unsigned reg = in[0] - (0x34c0 + 0x1f50);
+            if (reg == 0) *(uint32_t *)buf = 1;
+            if (reg == 2) *(uint32_t *)buf = 4;
+            if (reg == 4) *(uint32_t *)buf = (strtoul(getenv("AUX_STATUS_BYTES"),0,0) << 24) | 1;
+        }
         if (sel == 102 && *sz >= 4) {
             if (in[0] == 0x2511000 + 32 && !getenv("MES_TIMEOUT")) *(uint32_t *)buf = fake_seq;
             if (in[0] == 0x2511000 + 64) *(uint32_t *)buf = 1;
@@ -101,7 +107,7 @@ class TransportCLI(unittest.TestCase):
         compiler = shutil.which('clang') or shutil.which('cc')
         if not compiler:
             raise RuntimeError('C compiler required for CLI regression tests')
-        for name in ('phxctl', 'mesboot'):
+        for name in ('phxctl', 'mesboot', 'phxaux'):
             subprocess.run([compiler, '-std=gnu11', '-O2', '-Wall', '-Wextra',
                             '-I', str(cls.base), str(ROOT / 'tools/phxctl' / (name + '.c')),
                             '-o', str(cls.base / name)], check=True, capture_output=True, text=True)
@@ -116,6 +122,21 @@ class TransportCLI(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         calls = [list(map(int, line.split())) for line in events.read_text().splitlines()]
         return result, calls
+
+    def test_aux_rejects_bad_arguments_before_io(self):
+        for args in (['-a','5','scan'], ['-a','-1','scan'], ['read','0x100000'],
+                     ['write','0x721','256'], ['write','0x721','oops'],
+                     ['read','0x700','1junk'], ['scan','extra'], ['read','0xfffff','2']):
+            with self.subTest(args=args):
+                result, calls = self.run_cli('phxaux',args)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertEqual(calls,[])
+
+    def test_aux_rejects_reply_larger_than_read_buffer(self):
+        result, calls = self.run_cli('phxaux',['read','0x700','16'],AUX_STATUS_BYTES='31')
+        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+        self.assertNotIn('0x00700:',result.stdout)
+        self.assertTrue(any(c[0]==108 and c[2]==0x34c0+0x1f50+2 and c[3] & (1<<17) for c in calls))
 
     def phx_commands(self):
         return [(['regs', '1', '2'], 2), (['gc'], 2), (['smu', '1'], 100),

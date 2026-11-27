@@ -98,5 +98,37 @@ class UninstallSafety(unittest.TestCase):
             self.assertTrue(builder.exists())
 
 
+class InstallAttachmentDiagnostics(unittest.TestCase):
+    def check_attachment(self, registry, loaded):
+        source = (ROOT / 'install/install.sh').read_text()
+        start = source.index('IOR=$(ioreg -l -w0)')
+        end = source.index('for f in EFI/OC/Kexts/', start)
+        harness = """say() { printf '%s\\n' "$*"; }
+fail() { say "$*"; FAILED=1; }
+FAILED=0
+ioreg() { printf '%s\\n' "$REGISTRY"; }
+kmutil() { printf '%s\\n' "$LOADED"; }
+""" + source[start:end] + '\nexit "$FAILED"\n'
+        return subprocess.run(['bash', '-c', harness], capture_output=True, text=True,
+                              env=dict(os.environ, REGISTRY=registry, LOADED=loaded))
+
+    def test_injected_binary_without_service_explains_attachment_failure(self):
+        result = self.check_attachment('', 'org.drip.PhxBringup (1.0.0)')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('binary is loaded, but no attached service', result.stdout)
+        self.assertIn('PCI/subsystem IDs', result.stdout)
+        self.assertIn('injection', result.stdout)
+
+    def test_missing_binary_explains_opencore_configuration(self):
+        result = self.check_attachment('', '')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Kernel -> Add', result.stdout)
+
+    def test_attached_service_reports_start_success(self):
+        result = self.check_attachment('"phx-build" = 34', '')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('attached and started (build 34)', result.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

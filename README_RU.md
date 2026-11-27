@@ -1,3 +1,5 @@
+> Проект всё ещё написан нейросетями. Если вас это оскорбляет, он всё равно работает — так что просто закройте эту вкладку и перестаньте отрицать современные технологии.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/nullarc-logo-dark.svg">

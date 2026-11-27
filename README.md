@@ -1,3 +1,5 @@
+> This project is still written by neural networks. If that offends you, it still works—so just close this tab and stop denying modern technology.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/nullarc-logo-dark.svg">
