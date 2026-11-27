@@ -1,4 +1,4 @@
-> This project is still written by neural networks. If that offends you, it still works—so just close this tab and stop denying modern technology.
+> This project is still written by ai. If that offends you, it still works — so just close this tab and stop denying modern technology.
 
 <p align="center">
   <picture>
